@@ -1,0 +1,15 @@
+LIBRARY "mai2io"
+EXPORTS
+    mai2_io_get_api_version
+    mai2_io_init
+    mai2_io_poll
+    mai2_io_get_opbtns
+    mai2_io_get_gamebtns
+    mai2_io_touch_init
+    mai2_io_touch_set_sens
+    mai2_io_touch_update
+    mai2_io_led_init
+    mai2_io_led_set_fet_output
+    mai2_io_led_dc_update
+    mai2_io_led_gs_update
+    mai2_io_led_billboard_set
