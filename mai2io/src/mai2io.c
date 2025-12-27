@@ -30,6 +30,19 @@ static uint8_t mai2_last_opbtn;
 static uint16_t mai2_last_player1_btn;
 static uint16_t mai2_last_player2_btn;
 
+static const wchar_t *mai2_get_config_path(void)
+{
+    static wchar_t path[MAX_PATH];
+    DWORD len;
+
+    len = GetEnvironmentVariableW(L"SEGATOOLS_CONFIG_PATH", path, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) {
+        return L".\\segatools.ini";
+    }
+
+    return path;
+}
+
 typedef struct {
     uint8_t r;
     uint8_t g;
@@ -57,7 +70,7 @@ static bool mai2_gs_capture_enabled;
 
 static void mai2_load_config(void)
 {
-    const wchar_t *ini = L".\\segatools.ini";
+    const wchar_t *ini = mai2_get_config_path();
 
     if (mai2_cfg_loaded) {
         return;
