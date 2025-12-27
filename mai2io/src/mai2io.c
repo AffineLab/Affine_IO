@@ -9,6 +9,10 @@
 #include "affine_io.h"
 #include "dprintf.h"
 
+#ifndef MAI2IO_VERSION
+#define MAI2IO_VERSION "v1.0.0"
+#endif
+
 static uint8_t mai2_opbtn;
 static uint16_t mai2_player1_btn;
 static uint16_t mai2_player2_btn;
@@ -203,7 +207,7 @@ static void mai2_apply_affine_buttons(
 
 uint16_t mai2_io_get_api_version(void)
 {
-    return 0x0103;
+    return 0x0102;
 }
 
 HRESULT mai2_io_init(void)
@@ -218,7 +222,8 @@ HRESULT mai2_io_init(void)
     }
 
     dprintf("[Affine IO] Initializing...\n");
-    dprintf("[Affine IO] API Version: %d.%02d\n",
+    dprintf("[Affine IO] Affine IO Version: %s\n", MAI2IO_VERSION);
+    dprintf("[Affine IO] Mai2IO API Version: %d.%02d\n",
             mai2_io_get_api_version() >> 8,
             mai2_io_get_api_version() & 0xFF);
 
