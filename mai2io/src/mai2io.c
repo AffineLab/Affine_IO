@@ -10,7 +10,7 @@
 #include "dprintf.h"
 
 #ifndef MAI2IO_VERSION
-#define MAI2IO_VERSION "v1.0.0"
+#define MAI2IO_VERSION "v1.1.0"
 #endif
 
 static uint8_t mai2_opbtn;
@@ -473,7 +473,7 @@ void mai2_io_led_gs_update(uint8_t board, const uint8_t *rgb)
     LeaveCriticalSection(&mai2_led_cs);
 }
 
-void mai2_io_led_billboard_set(uint8_t board, uint8_t *rgb)
+void mai2_io_led_billboard_set(uint8_t board, const uint8_t *rgb)
 {
     uint8_t payload[24];
 
@@ -488,6 +488,11 @@ void mai2_io_led_billboard_set(uint8_t board, uint8_t *rgb)
     }
 
     affine_io_send_led_billboard(board + 1, payload);
+}
+
+void mai2_io_led_cam_set(uint8_t state)
+{
+    return;
 }
 
 static unsigned int __stdcall mai2_io_led_thread_proc(void *ctx)

@@ -40,4 +40,13 @@ HRESULT mai2_io_led_init(void);
 void mai2_io_led_set_fet_output(uint8_t board, const uint8_t *rgb);
 void mai2_io_led_dc_update(uint8_t board, const uint8_t *rgb);
 void mai2_io_led_gs_update(uint8_t board, const uint8_t *rgb);
-void mai2_io_led_billboard_set(uint8_t board, uint8_t *rgb);
+void mai2_io_led_billboard_set(uint8_t board, const uint8_t *rgb);
+
+enum {
+    MAI2_IO_LED_CAM_CODE_READER_1P = 0x01,
+    MAI2_IO_LED_CAM_CODE_READER_2P = 0x02,
+    MAI2_IO_LED_CAM_RING = 0x04,
+    MAI2_IO_LED_CAM_REC = 0x08,
+};
+
+void mai2_io_led_cam_set(uint8_t state);
