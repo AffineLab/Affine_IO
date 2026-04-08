@@ -1,9 +1,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use affine_core::serial::{SerialPort, find_com_port};
+use affine_core::shared_memory::SharedPage;
 use affine_core::types::{Hresult, Mai2TouchCallback, S_OK};
 use affine_core::util::{
     current_exe_name, ini_get_bool, log_line, segatools_config_path, sleep_ms, tick_ms,
@@ -39,20 +39,49 @@ const MAI2_AFFINE_EXT_TEST_BIT: u8 = 1;
 const MAI2_AFFINE_EXT_SERVICE_BIT: u8 = 2;
 const MAI2_AFFINE_EXT_COIN_BIT: u8 = 3;
 
+const MAI2_INPUT_MAPPING_NAMES: [&str; 2] = ["mai_io_shm_1", "mai_io_shm_2"];
+const MAI2_INPUT_MUTEX_NAMES: [&str; 2] = ["mai_io_shm_1_mutex", "mai_io_shm_2_mutex"];
+const MAI2_OUTPUT_MAPPING_NAMES: [&str; 2] = ["mai_io_ctrl_1", "mai_io_ctrl_2"];
+const MAI2_OUTPUT_MUTEX_NAMES: [&str; 2] = ["mai_io_ctrl_1_mutex", "mai_io_ctrl_2_mutex"];
+const MAI2_POLL_MAPPING_NAME: &str = "mai_io_poll";
+const MAI2_POLL_MUTEX_NAME: &str = "mai_io_poll_mutex";
+
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct DeviceSnapshot {
-    connected: bool,
+struct Mai2InputPage {
     buttons0: u8,
-    buttons1: u8,
+    io_status: u8,
+    connected: u8,
+    _reserved0: [u8; 5],
     touch: [u8; 7],
+    _reserved1: u8,
+    sequence: u64,
 }
 
-#[derive(Default)]
-struct PollState {
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Mai2OutputPage {
+    touch_enabled: u8,
+    _reserved0: [u8; 7],
+    buttons_sequence: u64,
+    buttons: [u8; 24],
+    billboard_sequence: u64,
+    billboard: [u8; 24],
+    pwm_sequence: u64,
+    pwm: [u8; 3],
+    _reserved1: [u8; 5],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Mai2PollPage {
     opbtn: u8,
+    _reserved0: u8,
     player1_btn: u16,
     player2_btn: u16,
-    affine_coin: bool,
+    affine_coin: u8,
+    _reserved1: [u8; 7],
+    sequence: u64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -79,7 +108,6 @@ struct LedState {
 
 struct SharedState {
     callback: Mutex<Mai2TouchCallback>,
-    poll_state: Mutex<PollState>,
     led_state: Mutex<LedState>,
 }
 
@@ -87,58 +115,50 @@ impl SharedState {
     fn new() -> Self {
         Self {
             callback: Mutex::new(None),
-            poll_state: Mutex::new(PollState::default()),
             led_state: Mutex::new(LedState::default()),
         }
     }
-}
-
-enum DeviceCommand {
-    Buttons([u8; 24]),
-    Billboard([u8; 24]),
-    Pwm([u8; 3]),
 }
 
 struct DeviceHandle {
     player: u8,
     pid: u16,
     enabled: AtomicBool,
-    touch_enabled: AtomicBool,
-    snapshot: Mutex<DeviceSnapshot>,
-    tx: Sender<DeviceCommand>,
+    input_page: SharedPage<Mai2InputPage>,
+    output_page: SharedPage<Mai2OutputPage>,
 }
 
 impl DeviceHandle {
-    fn new(player: u8, pid: u16, enabled: bool) -> (Arc<Self>, Receiver<DeviceCommand>) {
-        let (tx, rx) = mpsc::channel();
-        let handle = Arc::new(Self {
+    fn new(player: u8, pid: u16, enabled: bool, index: usize) -> Arc<Self> {
+        let input_page: SharedPage<Mai2InputPage> = SharedPage::create(
+            MAI2_INPUT_MAPPING_NAMES[index],
+            MAI2_INPUT_MUTEX_NAMES[index],
+        )
+        .expect("mai2 input shared memory");
+        let output_page: SharedPage<Mai2OutputPage> = SharedPage::create(
+            MAI2_OUTPUT_MAPPING_NAMES[index],
+            MAI2_OUTPUT_MUTEX_NAMES[index],
+        )
+        .expect("mai2 output shared memory");
+
+        output_page.update(|page| {
+            page.touch_enabled = enabled as u8;
+        });
+
+        Arc::new(Self {
             player,
             pid,
             enabled: AtomicBool::new(enabled),
-            touch_enabled: AtomicBool::new(false),
-            snapshot: Mutex::new(DeviceSnapshot::default()),
-            tx,
-        });
-        (handle, rx)
-    }
-
-    fn snapshot(&self) -> DeviceSnapshot {
-        *self.snapshot.lock().unwrap()
-    }
-
-    fn set_snapshot(&self, snapshot: DeviceSnapshot) {
-        *self.snapshot.lock().unwrap() = snapshot;
-    }
-
-    fn send(&self, command: DeviceCommand) {
-        let _ = self.tx.send(command);
+            input_page,
+            output_page,
+        })
     }
 }
 
 pub struct Mai2Runtime {
     shared: Arc<SharedState>,
     devices: [Arc<DeviceHandle>; 2],
-    device_rxs: Mutex<Option<[Receiver<DeviceCommand>; 2]>>,
+    poll_page: SharedPage<Mai2PollPage>,
     initialized: AtomicBool,
     led_started: AtomicBool,
 }
@@ -160,13 +180,16 @@ impl Mai2Runtime {
         ));
 
         let shared = Arc::new(SharedState::new());
-        let (p1, rx1) = DeviceHandle::new(1, MAI2_PID_1P, p1_enabled);
-        let (p2, rx2) = DeviceHandle::new(2, MAI2_PID_2P, p2_enabled);
+        let p1 = DeviceHandle::new(1, MAI2_PID_1P, p1_enabled, 0);
+        let p2 = DeviceHandle::new(2, MAI2_PID_2P, p2_enabled, 1);
+        let poll_page: SharedPage<Mai2PollPage> =
+            SharedPage::create(MAI2_POLL_MAPPING_NAME, MAI2_POLL_MUTEX_NAME)
+                .expect("mai2 poll shared memory");
 
         Arc::new(Self {
             shared,
             devices: [p1, p2],
-            device_rxs: Mutex::new(Some([rx1, rx2])),
+            poll_page,
             initialized: AtomicBool::new(false),
             led_started: AtomicBool::new(false),
         })
@@ -190,12 +213,10 @@ impl Mai2Runtime {
             }
         }
 
-        if let Some(receivers) = self.device_rxs.lock().unwrap().take() {
-            for (index, receiver) in receivers.into_iter().enumerate() {
-                let device = self.devices[index].clone();
-                let shared = self.shared.clone();
-                thread::spawn(move || device_thread(device, receiver, shared));
-            }
+        for device in &self.devices {
+            let device = device.clone();
+            let shared = self.shared.clone();
+            thread::spawn(move || device_thread(device, shared));
         }
 
         log_line("[Affine IO] Initialization complete.");
@@ -203,58 +224,64 @@ impl Mai2Runtime {
     }
 
     pub fn poll(&self) -> Hresult {
-        let p1 = self.devices[0].snapshot();
-        let p2 = self.devices[1].snapshot();
-        let mut poll_state = self.shared.poll_state.lock().unwrap();
+        let p1 = self.devices[0].input_page.read();
+        let p2 = self.devices[1].input_page.read();
 
-        poll_state.opbtn = 0;
-        poll_state.player1_btn = 0;
-        poll_state.player2_btn = 0;
+        self.poll_page.update(|poll_state| {
+            let mut opbtn = 0;
+            let mut player1_btn = 0;
+            let mut player2_btn = 0;
 
-        if p1.connected {
-            poll_state.player1_btn = map_buttons(p1.buttons0, p1.buttons1);
+            if p1.connected != 0 {
+                player1_btn = map_buttons(p1.buttons0, p1.io_status);
 
-            if p1.buttons1 & (1 << MAI2_AFFINE_EXT_TEST_BIT) != 0 {
-                poll_state.opbtn |= MAI2_IO_OPBTN_TEST;
-            }
-            if p1.buttons1 & (1 << MAI2_AFFINE_EXT_SERVICE_BIT) != 0 {
-                poll_state.opbtn |= MAI2_IO_OPBTN_SERVICE;
-            }
+                if p1.io_status & (1 << MAI2_AFFINE_EXT_TEST_BIT) != 0 {
+                    opbtn |= MAI2_IO_OPBTN_TEST;
+                }
+                if p1.io_status & (1 << MAI2_AFFINE_EXT_SERVICE_BIT) != 0 {
+                    opbtn |= MAI2_IO_OPBTN_SERVICE;
+                }
 
-            let coin_pressed = p1.buttons1 & (1 << MAI2_AFFINE_EXT_COIN_BIT) != 0;
-            if coin_pressed {
-                if !poll_state.affine_coin {
-                    poll_state.affine_coin = true;
-                    poll_state.opbtn |= MAI2_IO_OPBTN_COIN;
+                let coin_pressed = p1.io_status & (1 << MAI2_AFFINE_EXT_COIN_BIT) != 0;
+                if coin_pressed {
+                    if poll_state.affine_coin == 0 {
+                        poll_state.affine_coin = 1;
+                        opbtn |= MAI2_IO_OPBTN_COIN;
+                    }
+                } else {
+                    poll_state.affine_coin = 0;
                 }
             } else {
-                poll_state.affine_coin = false;
+                poll_state.affine_coin = 0;
             }
-        } else {
-            poll_state.affine_coin = false;
-        }
 
-        if p2.connected {
-            poll_state.player2_btn = map_buttons(p2.buttons0, p2.buttons1);
+            if p2.connected != 0 {
+                player2_btn = map_buttons(p2.buttons0, p2.io_status);
 
-            if p2.buttons1 & (1 << MAI2_AFFINE_EXT_TEST_BIT) != 0 {
-                poll_state.opbtn |= MAI2_IO_OPBTN_TEST;
+                if p2.io_status & (1 << MAI2_AFFINE_EXT_TEST_BIT) != 0 {
+                    opbtn |= MAI2_IO_OPBTN_TEST;
+                }
+                if p2.io_status & (1 << MAI2_AFFINE_EXT_SERVICE_BIT) != 0 {
+                    opbtn |= MAI2_IO_OPBTN_SERVICE;
+                }
             }
-            if p2.buttons1 & (1 << MAI2_AFFINE_EXT_SERVICE_BIT) != 0 {
-                poll_state.opbtn |= MAI2_IO_OPBTN_SERVICE;
-            }
-        }
+
+            poll_state.opbtn = opbtn;
+            poll_state.player1_btn = player1_btn;
+            poll_state.player2_btn = player2_btn;
+            poll_state.sequence = poll_state.sequence.wrapping_add(1);
+        });
 
         S_OK
     }
 
     pub fn get_opbtns(&self) -> u8 {
-        self.shared.poll_state.lock().unwrap().opbtn
+        self.poll_page.read().opbtn
     }
 
     pub fn get_gamebtns(&self) -> (u16, u16) {
-        let state = self.shared.poll_state.lock().unwrap();
-        (state.player1_btn, state.player2_btn)
+        let page = self.poll_page.read();
+        (page.player1_btn, page.player2_btn)
     }
 
     pub fn set_touch_callback(&self, callback: Mai2TouchCallback) {
@@ -263,11 +290,11 @@ impl Mai2Runtime {
 
     pub fn set_touch_enabled(&self, player1: bool, player2: bool) {
         self.devices[0]
-            .touch_enabled
-            .store(player1, Ordering::SeqCst);
+            .output_page
+            .update(|page| page.touch_enabled = player1 as u8);
         self.devices[1]
-            .touch_enabled
-            .store(player2, Ordering::SeqCst);
+            .output_page
+            .update(|page| page.touch_enabled = player2 as u8);
     }
 
     pub fn led_init(&self) -> Hresult {
@@ -284,7 +311,10 @@ impl Mai2Runtime {
 
     pub fn led_set_fet_output(&self, board: u8, rgb: [u8; 3]) {
         if let Some(device) = self.devices.get(board as usize) {
-            device.send(DeviceCommand::Pwm(rgb));
+            device.output_page.update(|page| {
+                page.pwm = rgb;
+                page.pwm_sequence = page.pwm_sequence.wrapping_add(1);
+            });
         }
     }
 
@@ -325,7 +355,10 @@ impl Mai2Runtime {
         }
 
         if let Some(payload) = immediate {
-            self.devices[board].send(DeviceCommand::Buttons(payload));
+            self.devices[board].output_page.update(|page| {
+                page.buttons = payload;
+                page.buttons_sequence = page.buttons_sequence.wrapping_add(1);
+            });
         }
     }
 
@@ -341,7 +374,10 @@ impl Mai2Runtime {
             chunk[2] = rgb[2];
         }
 
-        self.devices[board as usize].send(DeviceCommand::Billboard(payload));
+        self.devices[board as usize].output_page.update(|page| {
+            page.billboard = payload;
+            page.billboard_sequence = page.billboard_sequence.wrapping_add(1);
+        });
     }
 
     #[cfg(feature = "latency-bench")]
@@ -353,17 +389,14 @@ impl Mai2Runtime {
         apply_device_frame(
             device,
             &self.shared,
-            Some([buttons0 & 0x0F, buttons0 & 0xF0, buttons1 & 0x3F]),
+            Some(buttons0),
+            Some(buttons1),
             Some(touch),
         );
     }
 }
 
-fn device_thread(
-    device: Arc<DeviceHandle>,
-    receiver: Receiver<DeviceCommand>,
-    shared: Arc<SharedState>,
-) {
+fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
     let mut port = SerialPort::default();
     let mut rx_buf = [0u8; 128];
     let mut rx_len = 0usize;
@@ -373,12 +406,15 @@ fn device_thread(
     let mut board_info_logged = false;
     let mut board_info_start_ms = 0u64;
     let mut board_info_request_ms = 0u64;
+    let mut last_buttons_sequence = 0u64;
+    let mut last_billboard_sequence = 0u64;
+    let mut last_pwm_sequence = 0u64;
 
     loop {
         if !device.enabled.load(Ordering::SeqCst) {
             if port.is_open() {
                 port.close();
-                device.set_snapshot(DeviceSnapshot::default());
+                device.input_page.write(Mai2InputPage::default());
             }
             sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
             continue;
@@ -416,9 +452,9 @@ fn device_thread(
                 device.player,
                 port_path.trim_start_matches("\\\\.\\")
             ));
-            device.set_snapshot(DeviceSnapshot {
-                connected: true,
-                ..Default::default()
+            device.input_page.update(|page| {
+                page.connected = 1;
+                page.sequence = page.sequence.wrapping_add(1);
             });
             rx_len = 0;
             last_heartbeat = tick_ms();
@@ -436,7 +472,7 @@ fn device_thread(
             {
                 if !send_frame(&mut port, AFFINE_CMD_GET_BOARD_INFO, &[]) {
                     port.close();
-                    device.set_snapshot(DeviceSnapshot::default());
+                    device.input_page.write(Mai2InputPage::default());
                     sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
                     continue;
                 }
@@ -446,7 +482,7 @@ fn device_thread(
             {
                 if !send_frame(&mut port, AFFINE_CMD_GET_BOARD_INFO, &[]) {
                     port.close();
-                    device.set_snapshot(DeviceSnapshot::default());
+                    device.input_page.write(Mai2InputPage::default());
                     sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
                     continue;
                 }
@@ -460,32 +496,49 @@ fn device_thread(
         } else if now.saturating_sub(last_heartbeat) >= AFFINE_HEARTBEAT_INTERVAL_MS {
             if !send_frame(&mut port, AFFINE_CMD_HEARTBEAT, &[]) {
                 port.close();
-                device.set_snapshot(DeviceSnapshot::default());
+                device.input_page.write(Mai2InputPage::default());
                 sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
                 continue;
             }
             last_heartbeat = now;
         }
 
-        while let Ok(command) = receiver.try_recv() {
-            let (cmd, payload): (u8, Vec<u8>) = match command {
-                DeviceCommand::Buttons(bytes) => (0x14, bytes.to_vec()),
-                DeviceCommand::Billboard(bytes) => (0x15, bytes.to_vec()),
-                DeviceCommand::Pwm(bytes) => (0x16, bytes.to_vec()),
-            };
+        let output = device.output_page.read();
 
-            if !send_frame(&mut port, cmd, &payload) {
+        if output.buttons_sequence != last_buttons_sequence {
+            if !send_frame(&mut port, 0x14, &output.buttons) {
                 port.close();
-                device.set_snapshot(DeviceSnapshot::default());
+                device.input_page.write(Mai2InputPage::default());
                 sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
                 continue;
             }
+            last_buttons_sequence = output.buttons_sequence;
+        }
+
+        if output.billboard_sequence != last_billboard_sequence {
+            if !send_frame(&mut port, 0x15, &output.billboard) {
+                port.close();
+                device.input_page.write(Mai2InputPage::default());
+                sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
+                continue;
+            }
+            last_billboard_sequence = output.billboard_sequence;
+        }
+
+        if output.pwm_sequence != last_pwm_sequence {
+            if !send_frame(&mut port, 0x16, &output.pwm) {
+                port.close();
+                device.input_page.write(Mai2InputPage::default());
+                sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
+                continue;
+            }
+            last_pwm_sequence = output.pwm_sequence;
         }
 
         let mut read_buf = [0u8; 64];
         let Some(read) = port.read(&mut read_buf) else {
             port.close();
-            device.set_snapshot(DeviceSnapshot::default());
+            device.input_page.write(Mai2InputPage::default());
             sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
             continue;
         };
@@ -503,8 +556,12 @@ fn device_thread(
 
             while let Some(frame) = try_parse_frame(&mut rx_buf, &mut rx_len) {
                 match frame {
-                    ParsedFrame::Touch { buttons, touch } => {
-                        apply_device_frame(&device, &shared, buttons, touch);
+                    ParsedFrame::Touch {
+                        buttons0,
+                        io_status,
+                        touch,
+                    } => {
+                        apply_device_frame(&device, &shared, buttons0, io_status, touch);
                     }
                     ParsedFrame::BoardInfo(version) => {
                         board_info_pending = false;
@@ -557,7 +614,10 @@ fn led_thread(devices: [Arc<DeviceHandle>; 2], shared: Arc<SharedState>) {
 
             if need_update || led_state.force_update[board] {
                 led_state.force_update[board] = false;
-                device.send(DeviceCommand::Buttons(payload));
+                device.output_page.update(|page| {
+                    page.buttons = payload;
+                    page.buttons_sequence = page.buttons_sequence.wrapping_add(1);
+                });
             }
         }
     }
@@ -565,7 +625,8 @@ fn led_thread(devices: [Arc<DeviceHandle>; 2], shared: Arc<SharedState>) {
 
 enum ParsedFrame {
     Touch {
-        buttons: Option<[u8; 3]>,
+        buttons0: Option<u8>,
+        io_status: Option<u8>,
         touch: Option<[u8; 7]>,
     },
     BoardInfo(String),
@@ -587,13 +648,14 @@ fn try_parse_frame(rx_buf: &mut [u8; 128], rx_len: &mut usize) -> Option<ParsedF
                     return None;
                 }
                 if rx_buf[13] == 0x0A {
-                    let mut buttons = [0u8; 3];
+                    let buttons0 = (rx_buf[3] & 0x0F) | (rx_buf[4] & 0xF0);
+                    let io_status = rx_buf[5] & 0x3F;
                     let mut touch = [0u8; 7];
-                    buttons.copy_from_slice(&rx_buf[3..6]);
                     touch.copy_from_slice(&rx_buf[6..13]);
                     consume(rx_buf, rx_len, 14);
                     return Some(ParsedFrame::Touch {
-                        buttons: Some(buttons),
+                        buttons0: Some(buttons0),
+                        io_status: Some(io_status),
                         touch: Some(touch),
                     });
                 }
@@ -625,7 +687,8 @@ fn try_parse_frame(rx_buf: &mut [u8; 128], rx_len: &mut usize) -> Option<ParsedF
                 touch.copy_from_slice(&rx_buf[1..8]);
                 consume(rx_buf, rx_len, 9);
                 return Some(ParsedFrame::Touch {
-                    buttons: None,
+                    buttons0: None,
+                    io_status: None,
                     touch: Some(touch),
                 });
             }
@@ -680,25 +743,29 @@ fn interpolate(start: u8, end: u8, progress: f32) -> u8 {
 fn apply_device_frame(
     device: &DeviceHandle,
     shared: &SharedState,
-    buttons: Option<[u8; 3]>,
+    buttons0: Option<u8>,
+    io_status: Option<u8>,
     touch: Option<[u8; 7]>,
 ) {
-    let mut snapshot = device.snapshot();
-    snapshot.connected = true;
-    if let Some(buttons) = buttons {
-        snapshot.buttons0 = (buttons[0] & 0x0F) | (buttons[1] & 0xF0);
-        snapshot.buttons1 = buttons[2] & 0x3F;
-    }
-    if let Some(touch) = touch {
-        snapshot.touch = touch;
-    }
-    device.set_snapshot(snapshot);
+    let (touch_copy, touch_enabled) = device.input_page.update(|page| {
+        page.connected = 1;
+        if let Some(buttons0) = buttons0 {
+            page.buttons0 = buttons0;
+        }
+        if let Some(io_status) = io_status {
+            page.io_status = io_status;
+        }
+        if let Some(touch) = touch {
+            page.touch = touch;
+        }
+        page.sequence = page.sequence.wrapping_add(1);
 
-    if device.touch_enabled.load(Ordering::SeqCst)
-        && let Some(callback) = *shared.callback.lock().unwrap()
-    {
+        (page.touch, device.output_page.read().touch_enabled != 0)
+    });
+
+    if touch_enabled && let Some(callback) = *shared.callback.lock().unwrap() {
         unsafe {
-            callback(device.player, snapshot.touch.as_ptr());
+            callback(device.player, touch_copy.as_ptr());
         }
     }
 }

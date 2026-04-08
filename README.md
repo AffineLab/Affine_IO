@@ -32,6 +32,10 @@ The runtime keeps compatibility with `SEGATOOLS_CONFIG_PATH` and
 `.\\segatools.ini`. The current hardware target is the Affine serial stack plus
 the Monica Sega-serial NFC reader.
 
+`mai2`, `chuni`, and `mercury` now use mandatory shared-memory state pages as
+their runtime transport. `mai2` keeps the legacy `mai_io_shm_1` and
+`mai_io_shm_2` mappings for input compatibility.
+
 ## CI
 
 GitHub Actions now includes:
