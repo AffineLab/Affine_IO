@@ -70,6 +70,17 @@ The one-way figures are estimates derived from host send/receive timestamps plus
 firmware `t_rx`/`t_tx` timestamps. They are useful for directionality, but they
 are not a strict clock-synchronized ground truth.
 
+`Mai_stm32` benchmark firmware can now also emit a scheduled `0x23` event packet.
+When that firmware is present, the benchmark prints:
+
+- calibrated `event -> host` latency
+- calibrated `tx -> host` latency
+
+These values use the `0x22` RTT samples to estimate a host/device clock offset,
+then measure the host receive time of the later device-originated event packet.
+They are direction-specific and more representative of `STM32 -> host` event
+delivery than simply splitting the RTT in half.
+
 ## Commercial use
 
 Please contact the author before any commercial use.

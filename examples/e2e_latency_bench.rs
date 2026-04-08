@@ -16,9 +16,11 @@ mod bench {
     const CHUNI_PIDS: [u16; 2] = [0x52A4, 0x52A7];
     const SERIAL_BAUD: u32 = 115_200;
     const BENCHMARK_CMD: u8 = 0x22;
+    const BENCHMARK_EVENT_CMD: u8 = 0x23;
     const DEFAULT_ITERATIONS: usize = 500;
     const MAX_READ_SPINS: usize = 4;
     const ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(1);
+    const EVENT_DELAY_MS: u32 = 10;
 
     static MAI2_CALLBACKS: AtomicU64 = AtomicU64::new(0);
     static CHUNI_CALLBACKS: AtomicU64 = AtomicU64::new(0);
@@ -33,6 +35,12 @@ mod bench {
 
     struct BenchmarkReply {
         dispatch_cycles: u32,
+        tx_cycles: u32,
+        core_hz: u32,
+    }
+
+    struct EventReply {
+        event_cycles: u32,
         tx_cycles: u32,
         core_hz: u32,
     }
@@ -183,6 +191,7 @@ mod bench {
         let mut transit_samples_us = Vec::with_capacity(iterations);
         let mut host_to_device_samples_us = Vec::with_capacity(iterations);
         let mut device_to_host_samples_us = Vec::with_capacity(iterations);
+        let mut clock_offset_samples_us = Vec::with_capacity(iterations);
 
         for sequence in 0..iterations {
             let payload = make_benchmark_payload(sequence as u64);
@@ -214,18 +223,19 @@ mod bench {
             let host_recv_us = ticks_to_us(recv_ticks, frequency);
             let device_recv_us = cycles_to_us(reply.dispatch_cycles, reply.core_hz);
             let device_send_us = cycles_to_us(reply.tx_cycles, reply.core_hz);
-            let device_to_host_offset_us =
+            let clock_offset_us =
                 ((host_send_us + host_recv_us) - (device_recv_us + device_send_us)) / 2.0;
             let host_to_device_est_us =
-                ((device_to_host_offset_us + device_recv_us) - host_send_us).max(0.0);
+                ((clock_offset_us + device_recv_us) - host_send_us).max(0.0);
             let device_to_host_est_us =
-                (host_recv_us - (device_to_host_offset_us + device_send_us)).max(0.0);
+                (host_recv_us - (clock_offset_us + device_send_us)).max(0.0);
 
             host_samples_ticks.push(host_ticks);
             device_samples_us.push(device_us);
             transit_samples_us.push((host_us - device_us).max(0.0));
             host_to_device_samples_us.push(host_to_device_est_us);
             device_to_host_samples_us.push(device_to_host_est_us);
+            clock_offset_samples_us.push(clock_offset_us);
         }
 
         if host_samples_ticks.is_empty() {
@@ -245,7 +255,73 @@ mod bench {
             &format!("{label}-device-to-host-est"),
             device_to_host_samples_us,
         );
+        if matches!(protocol, Protocol::Mai2) {
+            bench_mai2_event_oneway(
+                label,
+                &mut port,
+                iterations,
+                frequency,
+                &clock_offset_samples_us,
+            );
+        }
         port.close();
+    }
+
+    fn bench_mai2_event_oneway(
+        label: &str,
+        port: &mut SerialPort,
+        iterations: usize,
+        frequency: f64,
+        clock_offset_samples_us: &[f64],
+    ) {
+        let Some(clock_offset_us) = robust_median(clock_offset_samples_us) else {
+            return;
+        };
+
+        let mut event_to_host_samples_us = Vec::with_capacity(iterations);
+        let mut tx_to_host_samples_us = Vec::with_capacity(iterations);
+        drain_port(port);
+
+        for sequence in 0..iterations {
+            let payload = make_event_arm_payload(sequence as u32, EVENT_DELAY_MS);
+            if !send_mai2_frame(port, BENCHMARK_EVENT_CMD, &payload) {
+                println!("{label}: event write failed on iteration {sequence}");
+                break;
+            }
+
+            let reply = match read_mai2_event_reply(port, sequence as u32) {
+                Some(reply) => reply,
+                None => {
+                    println!(
+                        "{label}: timeout waiting for event reply; check firmware event benchmark support"
+                    );
+                    break;
+                }
+            };
+
+            let recv_us = ticks_to_us(perf_counter(), frequency);
+            let event_host_est_us =
+                clock_offset_us + cycles_to_us(reply.event_cycles, reply.core_hz);
+            let tx_host_est_us = clock_offset_us + cycles_to_us(reply.tx_cycles, reply.core_hz);
+
+            event_to_host_samples_us.push((recv_us - event_host_est_us).max(0.0));
+            tx_to_host_samples_us.push((recv_us - tx_host_est_us).max(0.0));
+        }
+
+        if event_to_host_samples_us.is_empty() {
+            return;
+        }
+
+        println!(
+            "{label}: event-samples={} event-delay={}ms clock-offset={clock_offset_us:.3}us",
+            event_to_host_samples_us.len(),
+            EVENT_DELAY_MS
+        );
+        sample_stats_us(
+            &format!("{label}-event-to-host-cal"),
+            event_to_host_samples_us,
+        );
+        sample_stats_us(&format!("{label}-tx-to-host-cal"), tx_to_host_samples_us);
     }
 
     fn send_benchmark_request(port: &mut SerialPort, protocol: Protocol, payload: &[u8]) -> bool {
@@ -373,6 +449,57 @@ mod bench {
         None
     }
 
+    fn read_mai2_event_reply(port: &mut SerialPort, expected_sequence: u32) -> Option<EventReply> {
+        let deadline = Instant::now() + ROUNDTRIP_TIMEOUT;
+        let mut buf = [0u8; 64];
+        let mut rx_buf = [0u8; 256];
+        let mut rx_len = 0usize;
+        let mut idle_spins = 0usize;
+
+        while Instant::now() < deadline {
+            let read = match port.read(&mut buf) {
+                Some(read) => read,
+                None => return None,
+            };
+
+            if read == 0 {
+                idle_spins += 1;
+                if idle_spins >= MAX_READ_SPINS {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                continue;
+            }
+
+            idle_spins = 0;
+            let copy = read.min(rx_buf.len().saturating_sub(rx_len));
+            rx_buf[rx_len..rx_len + copy].copy_from_slice(&buf[..copy]);
+            rx_len += copy;
+
+            loop {
+                let Some(frame) = parse_mai2_frame(&mut rx_buf, &mut rx_len) else {
+                    break;
+                };
+
+                if frame.0 != BENCHMARK_EVENT_CMD || frame.1.len() != 16 {
+                    continue;
+                }
+
+                let sequence = read_u32_le(&frame.1[0..4]);
+                if sequence != expected_sequence {
+                    continue;
+                }
+
+                return Some(EventReply {
+                    event_cycles: read_u32_le(&frame.1[4..8]),
+                    tx_cycles: read_u32_le(&frame.1[8..12]),
+                    core_hz: read_u32_le(&frame.1[12..16]),
+                });
+            }
+        }
+
+        None
+    }
+
     fn parse_mai2_frame(rx_buf: &mut [u8; 256], rx_len: &mut usize) -> Option<(u8, Vec<u8>)> {
         while *rx_len > 0 && rx_buf[0] != 0xFF {
             consume(rx_buf, rx_len, 1);
@@ -419,6 +546,13 @@ mod bench {
         let mut payload = [0u8; 16];
         payload[..8].copy_from_slice(&sequence.to_le_bytes());
         payload[8..].copy_from_slice(&sequence.rotate_left(13).to_le_bytes());
+        payload
+    }
+
+    fn make_event_arm_payload(sequence: u32, delay_ms: u32) -> [u8; 8] {
+        let mut payload = [0u8; 8];
+        payload[..4].copy_from_slice(&sequence.to_le_bytes());
+        payload[4..].copy_from_slice(&delay_ms.to_le_bytes());
         payload
     }
 
@@ -605,6 +739,16 @@ mod bench {
             p(0.95),
             p(0.99),
         );
+    }
+
+    fn robust_median(samples: &[f64]) -> Option<f64> {
+        if samples.is_empty() {
+            return None;
+        }
+
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(|left, right| left.partial_cmp(right).unwrap());
+        Some(sorted[sorted.len() / 2])
     }
 
     fn perf_counter() -> i64 {
