@@ -50,17 +50,7 @@ jobs:
             throw "Missing build output: $source"
           }
 
-          $aliases = @(
-            'affine_io.dll',
-            'aimeio.dll',
-            'mai2io.dll',
-            'chuniio.dll',
-            'mercuryio.dll'
-          )
-
-          foreach ($alias in $aliases) {
-            Copy-Item -LiteralPath $source -Destination (Join-Path $dist $alias) -Force
-          }
+          Copy-Item -LiteralPath $source -Destination (Join-Path $dist 'affine_io.dll') -Force
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4

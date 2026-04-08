@@ -18,8 +18,7 @@ Output DLLs:
 ## Usage
 
 Point the relevant `segatools` DLL paths at the same physical DLL, or copy the
-same built binary under the expected file names such as `aimeio.dll`,
-`mai2io.dll`, `chuniio.dll`, and `mercuryio.dll`.
+same built binary as `affine_io.dll`.
 
 The runtime keeps compatibility with `SEGATOOLS_CONFIG_PATH` and
 `.\\segatools.ini`. The current hardware target is the Affine serial stack plus
@@ -30,8 +29,8 @@ the Monica Sega-serial NFC reader.
 GitHub Actions now includes:
 
 - `CI`: `fmt`, `clippy`, and `cargo test`
-- `Build`: release DLL builds for both `x64` and `x86`, with packaged alias
-  names for `aimeio.dll`, `mai2io.dll`, `chuniio.dll`, and `mercuryio.dll`
+- `Build`: release DLL builds for both `x64` and `x86`, packaging only
+  `affine_io.dll`
 
 ## Commercial use
 
