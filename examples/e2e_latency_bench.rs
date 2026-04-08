@@ -25,7 +25,7 @@ mod bench {
     const EVENT_DELAY_MS: u32 = 10;
     const MAI2_HID_USAGE_PAGE: u16 = 0xFFCA;
     const MAI2_HID_USAGE: u16 = 0x0001;
-    const MAI2_HID_REPORT_LEN: usize = 16;
+    const MAI2_HID_REPORT_LEN: usize = 24;
 
     static MAI2_CALLBACKS: AtomicU64 = AtomicU64::new(0);
     static CHUNI_CALLBACKS: AtomicU64 = AtomicU64::new(0);
@@ -39,14 +39,14 @@ mod bench {
     }
 
     struct BenchmarkReply {
-        dispatch_cycles: u32,
-        tx_cycles: u32,
+        dispatch_cycles: u64,
+        tx_cycles: u64,
         core_hz: u32,
     }
 
     struct EventReply {
-        event_cycles: u32,
-        tx_cycles: u32,
+        event_cycles: u64,
+        tx_cycles: u64,
         core_hz: u32,
     }
 
@@ -442,7 +442,7 @@ mod bench {
         let deadline = Instant::now() + ROUNDTRIP_TIMEOUT;
         let mut parser = SliderParser::default();
         let mut buf = [0u8; 64];
-        let expected_len = expected_payload.len() + 12;
+        let expected_len = expected_payload.len() + 20;
         let mut idle_spins = 0usize;
 
         while Instant::now() < deadline {
@@ -475,9 +475,9 @@ mod bench {
 
                 let meta = &packet.payload[expected_payload.len()..];
                 return Some(BenchmarkReply {
-                    dispatch_cycles: read_u32_le(&meta[0..4]),
-                    tx_cycles: read_u32_le(&meta[4..8]),
-                    core_hz: read_u32_le(&meta[8..12]),
+                    dispatch_cycles: read_u64_le(&meta[0..8]),
+                    tx_cycles: read_u64_le(&meta[8..16]),
+                    core_hz: read_u32_le(&meta[16..20]),
                 });
             }
         }
@@ -493,7 +493,7 @@ mod bench {
         let mut buf = [0u8; 64];
         let mut rx_buf = [0u8; 256];
         let mut rx_len = 0usize;
-        let expected_len = expected_payload.len() + 12;
+        let expected_len = expected_payload.len() + 20;
         let mut idle_spins = 0usize;
 
         while Instant::now() < deadline {
@@ -530,9 +530,9 @@ mod bench {
 
                 let meta = &frame.1[expected_payload.len()..];
                 return Some(BenchmarkReply {
-                    dispatch_cycles: read_u32_le(&meta[0..4]),
-                    tx_cycles: read_u32_le(&meta[4..8]),
-                    core_hz: read_u32_le(&meta[8..12]),
+                    dispatch_cycles: read_u64_le(&meta[0..8]),
+                    tx_cycles: read_u64_le(&meta[8..16]),
+                    core_hz: read_u32_le(&meta[16..20]),
                 });
             }
         }
@@ -571,7 +571,7 @@ mod bench {
                     break;
                 };
 
-                if frame.0 != BENCHMARK_EVENT_CMD || frame.1.len() != 16 {
+                if frame.0 != BENCHMARK_EVENT_CMD || frame.1.len() != 24 {
                     continue;
                 }
 
@@ -581,9 +581,9 @@ mod bench {
                 }
 
                 return Some(EventReply {
-                    event_cycles: read_u32_le(&frame.1[4..8]),
-                    tx_cycles: read_u32_le(&frame.1[8..12]),
-                    core_hz: read_u32_le(&frame.1[12..16]),
+                    event_cycles: read_u64_le(&frame.1[4..12]),
+                    tx_cycles: read_u64_le(&frame.1[12..20]),
+                    core_hz: read_u32_le(&frame.1[20..24]),
                 });
             }
         }
@@ -608,9 +608,9 @@ mod bench {
                     }
 
                     return Some(EventReply {
-                        event_cycles: read_u32_le(&report[4..8]),
-                        tx_cycles: read_u32_le(&report[8..12]),
-                        core_hz: read_u32_le(&report[12..16]),
+                        event_cycles: read_u64_le(&report[4..12]),
+                        tx_cycles: read_u64_le(&report[12..20]),
+                        core_hz: read_u32_le(&report[20..24]),
                     });
                 }
                 Ok(_) => continue,
@@ -691,6 +691,12 @@ mod bench {
         u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])
     }
 
+    fn read_u64_le(raw: &[u8]) -> u64 {
+        u64::from_le_bytes([
+            raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+        ])
+    }
+
     fn find_hid_path(api: &HidApi, vid: u16, pid: u16) -> Option<std::ffi::CString> {
         api.device_list()
             .find(|info| {
@@ -723,7 +729,7 @@ mod bench {
         *rx_len -= count;
     }
 
-    fn cycles_to_us(cycles: u32, core_hz: u32) -> f64 {
+    fn cycles_to_us(cycles: u64, core_hz: u32) -> f64 {
         if core_hz == 0 {
             0.0
         } else {
