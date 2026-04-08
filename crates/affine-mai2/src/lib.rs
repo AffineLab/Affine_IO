@@ -410,7 +410,6 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
     let mut port = SerialPort::default();
     let mut rx_buf = [0u8; 128];
     let mut rx_len = 0usize;
-    let mut last_scan_log = 0u64;
     let mut last_heartbeat = tick_ms();
     let mut board_info_pending = false;
     let mut board_info_logged = false;
@@ -419,6 +418,8 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
     let mut last_buttons_sequence = 0u64;
     let mut last_billboard_sequence = 0u64;
     let mut last_pwm_sequence = 0u64;
+    let mut device_missing_logged = false;
+    let mut port_open_failed_logged = false;
 
     loop {
         if !device.enabled.load(Ordering::SeqCst) {
@@ -426,33 +427,35 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
                 port.close();
                 device.input_page.write(Mai2InputPage::default());
             }
+            device_missing_logged = false;
+            port_open_failed_logged = false;
             sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
             continue;
         }
 
         if !port.is_open() {
             let Some(port_path) = find_com_port(AFFINE_VID, device.pid) else {
-                let now = tick_ms();
-                if now.saturating_sub(last_scan_log) >= 5_000 {
+                if !device_missing_logged {
                     log_line(&format!(
                         "[Affine IO] P{}: Device not found (VID_{AFFINE_VID:04X} PID_{:04X})",
                         device.player, device.pid
                     ));
-                    last_scan_log = now;
+                    device_missing_logged = true;
                 }
+                port_open_failed_logged = false;
                 sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
                 continue;
             };
 
             if !port.open(&port_path, 115_200) {
-                let now = tick_ms();
-                if now.saturating_sub(last_scan_log) >= 5_000 {
+                if !port_open_failed_logged {
                     log_line(&format!(
                         "[Affine IO] P{}: Failed to open port {port_path}",
                         device.player
                     ));
-                    last_scan_log = now;
+                    port_open_failed_logged = true;
                 }
+                device_missing_logged = false;
                 sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
                 continue;
             }
@@ -462,6 +465,8 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
                 device.player,
                 port_path.trim_start_matches("\\\\.\\")
             ));
+            device_missing_logged = false;
+            port_open_failed_logged = false;
             device.input_page.update(|page| {
                 page.connected = 1;
                 page.sequence = page.sequence.wrapping_add(1);
@@ -595,54 +600,62 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
 }
 
 fn hid_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
-    let mut last_scan_log = 0u64;
+    let mut hid_unavailable_logged = false;
+    let mut hid_missing_logged = false;
+    let mut hid_open_failed_logged = false;
 
     loop {
         if !device.enabled.load(Ordering::SeqCst) {
             device.hid_connected.store(false, Ordering::SeqCst);
+            hid_unavailable_logged = false;
+            hid_missing_logged = false;
+            hid_open_failed_logged = false;
             sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
             continue;
         }
 
         let Ok(api) = HidApi::new() else {
-            let now = tick_ms();
-            if now.saturating_sub(last_scan_log) >= 5_000 {
+            if !hid_unavailable_logged {
                 log_line(&format!(
                     "[Affine IO] P{}: HID subsystem unavailable",
                     device.player
                 ));
-                last_scan_log = now;
+                hid_unavailable_logged = true;
             }
+            hid_missing_logged = false;
+            hid_open_failed_logged = false;
             sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
             continue;
         };
+        hid_unavailable_logged = false;
 
         let Some(path) = find_hid_path(&api, AFFINE_VID, device.pid) else {
-            let now = tick_ms();
-            if now.saturating_sub(last_scan_log) >= 5_000 {
+            if !hid_missing_logged {
                 log_line(&format!(
                     "[Affine IO] P{}: HID button interface not found (VID_{AFFINE_VID:04X} PID_{:04X})",
                     device.player, device.pid
                 ));
-                last_scan_log = now;
+                hid_missing_logged = true;
             }
+            hid_open_failed_logged = false;
             sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
             continue;
         };
+        hid_missing_logged = false;
 
         let path_display = path.to_string_lossy().into_owned();
         let Ok(hid) = api.open_path(&path) else {
-            let now = tick_ms();
-            if now.saturating_sub(last_scan_log) >= 5_000 {
+            if !hid_open_failed_logged {
                 log_line(&format!(
                     "[Affine IO] P{}: Failed to open HID path {}",
                     device.player, path_display
                 ));
-                last_scan_log = now;
+                hid_open_failed_logged = true;
             }
             sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
             continue;
         };
+        hid_open_failed_logged = false;
 
         log_line(&format!(
             "[Affine IO] Connected P{} HID buttons: {}",
