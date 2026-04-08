@@ -10,8 +10,8 @@ use affine_core::util::{
 };
 
 const AFFINE_VID: u16 = 0xAFF1;
-const AFFINE_PID_1P: u16 = 0x52A5;
-const AFFINE_PID_2P: u16 = 0x52A6;
+const MAI2_PID_1P: u16 = 0x52A5;
+const MAI2_PID_2P: u16 = 0x52A6;
 const AFFINE_CMD_HEARTBEAT: u8 = 0x11;
 const AFFINE_CMD_GET_BOARD_INFO: u8 = 0xF0;
 
@@ -160,8 +160,8 @@ impl Mai2Runtime {
         ));
 
         let shared = Arc::new(SharedState::new());
-        let (p1, rx1) = DeviceHandle::new(1, AFFINE_PID_1P, p1_enabled);
-        let (p2, rx2) = DeviceHandle::new(2, AFFINE_PID_2P, p2_enabled);
+        let (p1, rx1) = DeviceHandle::new(1, MAI2_PID_1P, p1_enabled);
+        let (p2, rx2) = DeviceHandle::new(2, MAI2_PID_2P, p2_enabled);
 
         Arc::new(Self {
             shared,
