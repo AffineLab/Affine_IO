@@ -56,11 +56,13 @@ measures:
 
 - Run: `cargo run --example e2e_latency_bench --features latency-bench`
 - Iterations: `cargo run --example e2e_latency_bench --features latency-bench -- --iterations=1000`
-- Synthetic-only extras: append `--synthetic`
+- Synthetic only: append `--synthetic`
+- Hardware plus synthetic: append `--all`
 
 The hardware mode currently expects the benchmark firmware command `0x22` on the
-`Mai_stm32` and `Chunithm_Stm32` boards. `--synthetic` keeps the old in-process
-callback/poll measurements for `mai2`, `chuni`, and `mercury`.
+`Mai_stm32` and `Chunithm_Stm32` boards. `--synthetic` skips hardware probing
+and only runs the old in-process callback/poll measurements for `mai2`,
+`chuni`, and `mercury`.
 
 ## Commercial use
 

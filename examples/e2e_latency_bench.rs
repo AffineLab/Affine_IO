@@ -27,7 +27,8 @@ mod bench {
     #[derive(Clone, Copy)]
     struct BenchConfig {
         iterations: usize,
-        synthetic: bool,
+        synthetic_only: bool,
+        include_synthetic: bool,
     }
 
     struct BenchmarkReply {
@@ -45,17 +46,21 @@ mod bench {
             config.iterations
         );
 
-        let mut ran_hardware = false;
-        ran_hardware |= bench_device_by_pid("mai2-p1", MAI2_PID_1P, config.iterations, frequency);
-        ran_hardware |= bench_device_by_pid("mai2-p2", MAI2_PID_2P, config.iterations, frequency);
-        ran_hardware |=
-            bench_device_by_any_pid("chuni-slider", &CHUNI_PIDS, config.iterations, frequency);
+        if !config.synthetic_only {
+            let mut ran_hardware = false;
+            ran_hardware |=
+                bench_device_by_pid("mai2-p1", MAI2_PID_1P, config.iterations, frequency);
+            ran_hardware |=
+                bench_device_by_pid("mai2-p2", MAI2_PID_2P, config.iterations, frequency);
+            ran_hardware |=
+                bench_device_by_any_pid("chuni-slider", &CHUNI_PIDS, config.iterations, frequency);
 
-        if !ran_hardware {
-            println!("no benchmark-capable firmware device detected");
+            if !ran_hardware {
+                println!("no benchmark-capable firmware device detected");
+            }
         }
 
-        if config.synthetic {
+        if config.include_synthetic {
             println!("synthetic benchmark mode enabled");
             bench_direct_call(config.iterations, frequency);
             bench_mai2_poll_path(config.iterations, frequency);
@@ -80,12 +85,19 @@ mod bench {
     fn parse_args() -> BenchConfig {
         let mut config = BenchConfig {
             iterations: DEFAULT_ITERATIONS,
-            synthetic: false,
+            synthetic_only: false,
+            include_synthetic: false,
         };
 
         for arg in env::args().skip(1) {
             if arg == "--synthetic" {
-                config.synthetic = true;
+                config.synthetic_only = true;
+                config.include_synthetic = true;
+                continue;
+            }
+
+            if arg == "--all" {
+                config.include_synthetic = true;
                 continue;
             }
 
