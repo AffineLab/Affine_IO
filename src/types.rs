@@ -1,11 +1,8 @@
-use core::ffi::c_void;
-
 pub type Hresult = windows_sys::core::HRESULT;
 
 pub const S_OK: Hresult = 0;
 pub const S_FALSE: Hresult = 1;
 pub const E_FAIL: Hresult = 0x8000_4005u32 as i32;
-pub const E_NOTIMPL: Hresult = 0x8000_4001u32 as i32;
 pub const E_INVALIDARG: Hresult = 0x8007_0057u32 as i32;
 
 #[repr(C)]
@@ -53,18 +50,6 @@ pub unsafe fn write_value<T: Copy>(dst: *mut T, value: T) {
     }
 }
 
-pub unsafe fn write_bytes(dst: *mut u8, src: &[u8]) -> bool {
-    if dst.is_null() {
-        return false;
-    }
-
-    unsafe {
-        core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
-    }
-
-    true
-}
-
 pub unsafe fn read_bytes<'a>(src: *const u8, len: usize) -> Option<&'a [u8]> {
     if src.is_null() {
         return None;
@@ -80,5 +65,3 @@ pub unsafe fn read_mut_bytes<'a>(src: *mut u8, len: usize) -> Option<&'a mut [u8
 
     Some(unsafe { core::slice::from_raw_parts_mut(src, len) })
 }
-
-pub type VoidPtr = *mut c_void;

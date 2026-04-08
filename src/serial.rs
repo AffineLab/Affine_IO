@@ -33,6 +33,8 @@ pub struct SerialPort {
     handle: HANDLE,
 }
 
+unsafe impl Send for SerialPort {}
+
 impl Default for SerialPort {
     fn default() -> Self {
         Self {

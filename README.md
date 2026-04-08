@@ -1,21 +1,28 @@
 # Affine IO
 
-Affine IO is a collection of serial IO DLLs for arcade games. It focuses on
-low latency, stable operation, and expanded features.
+Affine IO is now built as a single Rust `cdylib` that exports the current
+`segatools` ABI for `aimeio`, `mai2io`, `chuniio`, and `mercuryio`.
 
 ## Build
 
-- Toolchain: mingw-w64
-- Recommended environment: MSYS2 (https://www.msys2.org/)
+- Toolchain: stable Rust with the MSVC targets
+- x64: `cargo build --release`
+- x86: `cargo build --release --target i686-pc-windows-msvc`
 
-## Downloads
+Output DLLs:
 
-Prebuilt DLLs and test tools are available under Actions / Releases.
+- x64: `target/release/affine_io.dll`
+- x86: `target/i686-pc-windows-msvc/release/affine_io.dll`
 
-## Modules
+## Usage
 
-Currently includes chuniio, mai2io, mercuryio, and aimeio. More titles will be
-supported over time.
+Point the relevant `segatools` DLL paths at the same physical DLL, or copy the
+same built binary under the expected file names such as `aimeio.dll`,
+`mai2io.dll`, `chuniio.dll`, and `mercuryio.dll`.
+
+The runtime keeps compatibility with `SEGATOOLS_CONFIG_PATH` and
+`.\\segatools.ini`. The current hardware target is the Affine serial stack plus
+the Monica Sega-serial NFC reader.
 
 ## Commercial use
 
