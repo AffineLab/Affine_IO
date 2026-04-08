@@ -252,7 +252,10 @@ mod bench {
         println!("{label}: port={path} samples={}", host_samples_ticks.len());
         sample_stats_ticks(&format!("{label}-rtt"), host_samples_ticks, frequency);
         sample_stats_us(&format!("{label}-device"), device_samples_us);
-        sample_stats_us(&format!("{label}-host-minus-device"), transit_samples_us);
+        sample_stats_us(
+            &format!("{label}-host-minus-device"),
+            transit_samples_us.clone(),
+        );
         sample_stats_us(
             &format!("{label}-host-to-device-est"),
             host_to_device_samples_us.clone(),
@@ -262,7 +265,7 @@ mod bench {
             device_to_host_samples_us,
         );
         if matches!(protocol, Protocol::Mai2) {
-            bench_mai2_event_oneway(
+            let cdc_tx_to_host_us = bench_mai2_event_oneway(
                 label,
                 &mut port,
                 iterations,
@@ -270,13 +273,19 @@ mod bench {
                 &clock_offset_samples_us,
             );
             if let Some(pid) = pid {
+                let arm_path_est_us = cdc_tx_to_host_us
+                    .and_then(|tx_to_host_us| {
+                        robust_median(&transit_samples_us)
+                            .map(|transit_us| (transit_us - tx_to_host_us).max(0.0))
+                    })
+                    .or_else(|| robust_median(&host_to_device_samples_us));
                 bench_mai2_hid_event_oneway(
                     label,
                     pid,
                     &mut port,
                     iterations,
                     frequency,
-                    &host_to_device_samples_us,
+                    arm_path_est_us,
                 );
             }
         }
@@ -289,9 +298,9 @@ mod bench {
         iterations: usize,
         frequency: f64,
         clock_offset_samples_us: &[f64],
-    ) {
+    ) -> Option<f64> {
         let Some(clock_offset_us) = robust_median(clock_offset_samples_us) else {
-            return;
+            return None;
         };
 
         let mut event_to_host_samples_us = Vec::with_capacity(iterations);
@@ -325,9 +334,10 @@ mod bench {
         }
 
         if event_to_host_samples_us.is_empty() {
-            return;
+            return None;
         }
 
+        let tx_to_host_median_us = robust_median(&tx_to_host_samples_us);
         println!(
             "{label}: event-samples={} event-delay={}ms clock-offset={clock_offset_us:.3}us",
             event_to_host_samples_us.len(),
@@ -338,6 +348,7 @@ mod bench {
             event_to_host_samples_us,
         );
         sample_stats_us(&format!("{label}-tx-to-host-cal"), tx_to_host_samples_us);
+        tx_to_host_median_us
     }
 
     fn bench_mai2_hid_event_oneway(
@@ -346,9 +357,9 @@ mod bench {
         port: &mut SerialPort,
         iterations: usize,
         frequency: f64,
-        host_to_device_samples_us: &[f64],
+        arm_path_est_us: Option<f64>,
     ) {
-        let Some(host_to_device_us) = robust_median(host_to_device_samples_us) else {
+        let Some(host_to_device_us) = arm_path_est_us else {
             return;
         };
 
