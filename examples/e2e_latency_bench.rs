@@ -18,7 +18,10 @@ mod bench {
     const BENCHMARK_CMD: u8 = 0x22;
     const DEFAULT_ITERATIONS: usize = 500;
     const MAX_READ_SPINS: usize = 4;
+    const OPEN_RETRIES: usize = 10;
+    const OPEN_RETRY_DELAY: Duration = Duration::from_millis(100);
     const ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(1);
+    const WARMUP_REQUESTS: usize = 8;
 
     static MAI2_CALLBACKS: AtomicU64 = AtomicU64::new(0);
     static CHUNI_CALLBACKS: AtomicU64 = AtomicU64::new(0);
@@ -172,12 +175,14 @@ mod bench {
         frequency: f64,
     ) {
         let mut port = SerialPort::default();
-        if !port.open(path, SERIAL_BAUD) {
+        if !open_with_retry(&mut port, path) {
             println!("{label}: failed to open {path}");
             return;
         }
+        let _ = port.set_timeouts(1, 1, 0, 5, 0);
 
         drain_port(&mut port);
+        warmup_benchmark_port(&mut port, protocol);
 
         let mut host_samples_ticks = Vec::with_capacity(iterations);
         let mut device_samples_us = Vec::with_capacity(iterations);
@@ -215,13 +220,29 @@ mod bench {
         }
 
         if host_samples_ticks.is_empty() {
+            port.close();
             return;
         }
 
-        println!("{label}: port={path}");
+        println!("{label}: port={path} samples={}", host_samples_ticks.len());
         sample_stats_ticks(&format!("{label}-rtt"), host_samples_ticks, frequency);
         sample_stats_us(&format!("{label}-device"), device_samples_us);
         sample_stats_us(&format!("{label}-host-minus-device"), transit_samples_us);
+        port.close();
+    }
+
+    fn open_with_retry(port: &mut SerialPort, path: &str) -> bool {
+        for attempt in 0..OPEN_RETRIES {
+            if port.open(path, SERIAL_BAUD) {
+                return true;
+            }
+
+            if attempt + 1 < OPEN_RETRIES {
+                std::thread::sleep(OPEN_RETRY_DELAY);
+            }
+        }
+
+        false
     }
 
     fn send_benchmark_request(port: &mut SerialPort, protocol: Protocol, payload: &[u8]) -> bool {
@@ -389,6 +410,19 @@ mod bench {
                 Some(_) => {}
             }
         }
+    }
+
+    fn warmup_benchmark_port(port: &mut SerialPort, protocol: Protocol) {
+        for sequence in 0..WARMUP_REQUESTS {
+            let payload = make_benchmark_payload(sequence as u64);
+            if !send_benchmark_request(port, protocol, &payload) {
+                break;
+            }
+
+            let _ = read_benchmark_reply(port, protocol, &payload);
+        }
+
+        drain_port(port);
     }
 
     fn make_benchmark_payload(sequence: u64) -> [u8; 16] {

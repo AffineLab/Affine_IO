@@ -86,20 +86,48 @@ impl SerialPort {
             return false;
         }
 
-        let timeouts = COMMTIMEOUTS {
-            ReadIntervalTimeout: 20,
-            ReadTotalTimeoutConstant: 20,
-            ReadTotalTimeoutMultiplier: 5,
-            WriteTotalTimeoutConstant: 50,
-            WriteTotalTimeoutMultiplier: 5,
-        };
-
-        unsafe {
-            SetCommTimeouts(handle, &timeouts);
+        if !Self::apply_timeouts(
+            handle,
+            COMMTIMEOUTS {
+                ReadIntervalTimeout: 20,
+                ReadTotalTimeoutConstant: 20,
+                ReadTotalTimeoutMultiplier: 5,
+                WriteTotalTimeoutConstant: 50,
+                WriteTotalTimeoutMultiplier: 5,
+            },
+        ) {
+            unsafe {
+                CloseHandle(handle);
+            }
+            return false;
         }
 
         self.handle = handle;
         true
+    }
+
+    pub fn set_timeouts(
+        &mut self,
+        read_interval_timeout: u32,
+        read_total_timeout_constant: u32,
+        read_total_timeout_multiplier: u32,
+        write_total_timeout_constant: u32,
+        write_total_timeout_multiplier: u32,
+    ) -> bool {
+        if !self.is_open() {
+            return false;
+        }
+
+        Self::apply_timeouts(
+            self.handle,
+            COMMTIMEOUTS {
+                ReadIntervalTimeout: read_interval_timeout,
+                ReadTotalTimeoutConstant: read_total_timeout_constant,
+                ReadTotalTimeoutMultiplier: read_total_timeout_multiplier,
+                WriteTotalTimeoutConstant: write_total_timeout_constant,
+                WriteTotalTimeoutMultiplier: write_total_timeout_multiplier,
+            },
+        )
     }
 
     pub fn close(&mut self) {
@@ -155,6 +183,10 @@ impl SerialPort {
         };
 
         ok != 0 && written as usize == buf.len()
+    }
+
+    fn apply_timeouts(handle: HANDLE, timeouts: COMMTIMEOUTS) -> bool {
+        unsafe { SetCommTimeouts(handle, &timeouts) != 0 }
     }
 }
 
