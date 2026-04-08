@@ -265,7 +265,7 @@ mod bench {
             device_to_host_samples_us,
         );
         if matches!(protocol, Protocol::Mai2) {
-            let cdc_tx_to_host_us = bench_mai2_event_oneway(
+            let _cdc_tx_to_host_us = bench_mai2_event_oneway(
                 label,
                 &mut port,
                 iterations,
@@ -273,20 +273,7 @@ mod bench {
                 &clock_offset_samples_us,
             );
             if let Some(pid) = pid {
-                let arm_path_est_us = cdc_tx_to_host_us
-                    .and_then(|tx_to_host_us| {
-                        robust_median(&transit_samples_us)
-                            .map(|transit_us| (transit_us - tx_to_host_us).max(0.0))
-                    })
-                    .or_else(|| robust_median(&host_to_device_samples_us));
-                bench_mai2_hid_event_oneway(
-                    label,
-                    pid,
-                    &mut port,
-                    iterations,
-                    frequency,
-                    arm_path_est_us,
-                );
+                bench_mai2_hid_event_oneway(label, pid, &mut port, iterations, frequency);
             }
         }
         port.close();
@@ -357,12 +344,7 @@ mod bench {
         port: &mut SerialPort,
         iterations: usize,
         frequency: f64,
-        arm_path_est_us: Option<f64>,
     ) {
-        let Some(host_to_device_us) = arm_path_est_us else {
-            return;
-        };
-
         let Ok(api) = HidApi::new() else {
             println!("{label}: hid benchmark unavailable (hidapi init failed)");
             return;
@@ -380,14 +362,29 @@ mod bench {
 
         let mut event_to_host_samples_us = Vec::with_capacity(iterations);
         let mut tx_to_host_samples_us = Vec::with_capacity(iterations);
+        let mut arm_path_samples_us = Vec::with_capacity(iterations);
 
         for sequence in 0..iterations {
             let payload = make_event_arm_payload(sequence as u32, EVENT_DELAY_MS);
-            let send_us = ticks_to_us(perf_counter(), frequency);
+            let send_ticks = perf_counter();
             if !send_mai2_frame(port, BENCHMARK_HID_EVENT_CMD, &payload) {
                 println!("{label}: hid event write failed on iteration {sequence}");
                 break;
             }
+
+            let ack = match read_mai2_benchmark_reply_for_cmd(
+                port,
+                BENCHMARK_HID_EVENT_CMD,
+                &payload,
+            ) {
+                Some(reply) => reply,
+                None => {
+                    println!(
+                        "{label}: timeout waiting for hid arm ack; check firmware hid benchmark support"
+                    );
+                    break;
+                }
+            };
 
             let reply = match read_mai2_hid_event_reply(&hid, sequence as u16) {
                 Some(reply) => reply,
@@ -399,24 +396,30 @@ mod bench {
                 }
             };
 
+            let ack_recv_us = ticks_to_us(perf_counter(), frequency);
             let recv_us = ticks_to_us(perf_counter(), frequency);
-            let event_host_est_us = send_us + host_to_device_us + EVENT_DELAY_MS as f64 * 1000.0;
-            let tx_host_est_us = event_host_est_us
-                + cycles_to_us(
-                    reply.tx_cycles.wrapping_sub(reply.event_cycles),
-                    reply.core_hz,
-                );
+            let send_us = ticks_to_us(send_ticks, frequency);
+            let ack_device_recv_us = cycles_to_us(ack.dispatch_cycles, ack.core_hz);
+            let ack_device_send_us = cycles_to_us(ack.tx_cycles, ack.core_hz);
+            let clock_offset_us =
+                ((send_us + ack_recv_us) - (ack_device_recv_us + ack_device_send_us)) / 2.0;
+            let event_host_est_us =
+                clock_offset_us + cycles_to_us(reply.event_cycles, reply.core_hz);
+            let tx_host_est_us = clock_offset_us + cycles_to_us(reply.tx_cycles, reply.core_hz);
+            let arm_path_est_us = (clock_offset_us + ack_device_recv_us - send_us).max(0.0);
 
             event_to_host_samples_us.push((recv_us - event_host_est_us).max(0.0));
             tx_to_host_samples_us.push((recv_us - tx_host_est_us).max(0.0));
+            arm_path_samples_us.push(arm_path_est_us);
         }
 
         if event_to_host_samples_us.is_empty() {
             return;
         }
 
+        let arm_path_est_us = robust_median(&arm_path_samples_us).unwrap_or(0.0);
         println!(
-            "{label}: hid-event-samples={} event-delay={}ms arm-path-est={host_to_device_us:.3}us",
+            "{label}: hid-event-samples={} event-delay={}ms arm-path-est={arm_path_est_us:.3}us",
             event_to_host_samples_us.len(),
             EVENT_DELAY_MS
         );
@@ -445,7 +448,9 @@ mod bench {
         expected_payload: &[u8],
     ) -> Option<BenchmarkReply> {
         match protocol {
-            Protocol::Mai2 => read_mai2_benchmark_reply(port, expected_payload),
+            Protocol::Mai2 => {
+                read_mai2_benchmark_reply_for_cmd(port, BENCHMARK_CMD, expected_payload)
+            }
             Protocol::Slider => read_slider_benchmark_reply(port, expected_payload),
         }
     }
@@ -500,8 +505,9 @@ mod bench {
         None
     }
 
-    fn read_mai2_benchmark_reply(
+    fn read_mai2_benchmark_reply_for_cmd(
         port: &mut SerialPort,
+        expected_cmd: u8,
         expected_payload: &[u8],
     ) -> Option<BenchmarkReply> {
         let deadline = Instant::now() + ROUNDTRIP_TIMEOUT;
@@ -535,7 +541,7 @@ mod bench {
                     break;
                 };
 
-                if frame.0 != BENCHMARK_CMD || frame.1.len() != expected_len {
+                if frame.0 != expected_cmd || frame.1.len() != expected_len {
                     continue;
                 }
 
