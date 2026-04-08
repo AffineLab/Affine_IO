@@ -1,8 +1,8 @@
 use std::sync::{Mutex, OnceLock};
 
-use crate::serial::{SerialPort, find_com_port};
-use crate::types::{E_FAIL, E_INVALIDARG, Hresult, S_FALSE, S_OK};
-use crate::util::log_line;
+use affine_core::serial::{SerialPort, find_com_port};
+use affine_core::types::{E_FAIL, E_INVALIDARG, Hresult, S_FALSE, S_OK};
+use affine_core::util::log_line;
 
 const AFFINE_VID: u16 = 0xAFF1;
 const MONICA_PID: u16 = 0x5730;

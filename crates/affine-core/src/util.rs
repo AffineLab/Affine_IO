@@ -81,6 +81,16 @@ pub fn current_exe_name() -> Option<String> {
     })
 }
 
+pub fn should_log(last_scan_log: &mut u64) -> bool {
+    let now = tick_ms();
+    if now.saturating_sub(*last_scan_log) >= 5_000 {
+        *last_scan_log = now;
+        true
+    } else {
+        false
+    }
+}
+
 fn parse_bool(value: &str) -> Option<bool> {
     if value == "1"
         || value.eq_ignore_ascii_case("true")

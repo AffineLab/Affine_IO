@@ -1,7 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 
-use crate::aime;
-use crate::types::{AimeIoVfdState, Hresult, S_FALSE, read_bytes, read_mut_bytes};
+use affine_aime as aime;
+use affine_core::types::{AimeIoVfdState, Hresult, S_FALSE, read_bytes, read_mut_bytes};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn aime_io_get_api_version() -> u16 {

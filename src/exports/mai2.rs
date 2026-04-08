@@ -1,7 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 
-use crate::mai2;
-use crate::types::{Hresult, Mai2TouchCallback, S_OK, write_value};
+use affine_core::types::{Hresult, Mai2TouchCallback, S_OK, write_value};
+use affine_mai2 as mai2;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn mai2_io_get_api_version() -> u16 {

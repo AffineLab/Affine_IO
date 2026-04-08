@@ -3,9 +3,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
-use crate::serial::{SerialPort, find_com_port};
-use crate::types::{Hresult, Mai2TouchCallback, S_OK};
-use crate::util::{
+use affine_core::serial::{SerialPort, find_com_port};
+use affine_core::types::{Hresult, Mai2TouchCallback, S_OK};
+use affine_core::util::{
     current_exe_name, ini_get_bool, log_line, segatools_config_path, sleep_ms, tick_ms,
 };
 

@@ -37,7 +37,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release DLL
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build -p affine-io --release --locked --target ${{ matrix.target }}
 
       - name: Collect release artifacts
         shell: pwsh

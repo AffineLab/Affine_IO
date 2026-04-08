@@ -1,7 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 
-use crate::slider;
-use crate::types::{Hresult, MercuryLedData, MercuryTouchCallback, S_OK, write_value};
+use affine_core::types::{Hresult, MercuryLedData, MercuryTouchCallback, S_OK, write_value};
+use affine_mercury as mercury;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn mercury_io_get_api_version() -> u16 {
@@ -10,7 +10,7 @@ pub extern "C" fn mercury_io_get_api_version() -> u16 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn mercury_io_init() -> Hresult {
-    slider::mercury().init()
+    mercury::runtime().init()
 }
 
 #[unsafe(no_mangle)]
@@ -20,25 +20,25 @@ pub extern "C" fn mercury_io_poll() -> Hresult {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mercury_io_get_opbtns(opbtn: *mut u8) {
-    unsafe { write_value(opbtn, slider::mercury().opbtns()) };
+    unsafe { write_value(opbtn, mercury::runtime().opbtns()) };
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mercury_io_get_gamebtns(gamebtn: *mut u8) {
-    unsafe { write_value(gamebtn, slider::mercury().gamebtns()) };
+    unsafe { write_value(gamebtn, mercury::runtime().gamebtns()) };
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn mercury_io_touch_init() -> Hresult {
-    slider::mercury().init()
+    mercury::runtime().init()
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn mercury_io_touch_start(callback: MercuryTouchCallback) {
-    slider::mercury().start(callback);
+    mercury::runtime().start(callback);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn mercury_io_touch_set_leds(data: MercuryLedData) {
-    slider::mercury().set_leds(data);
+    mercury::runtime().set_leds(data);
 }

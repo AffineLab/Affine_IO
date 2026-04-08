@@ -3,10 +3,49 @@
 version = 4
 
 [[package]]
-name = "affine-io"
+name = "affine-aime"
+version = "0.1.0"
+dependencies = [
+ "affine-core",
+]
+
+[[package]]
+name = "affine-chuni"
+version = "0.1.0"
+dependencies = [
+ "affine-core",
+]
+
+[[package]]
+name = "affine-core"
 version = "0.1.0"
 dependencies = [
  "windows-sys",
+]
+
+[[package]]
+name = "affine-io"
+version = "0.1.0"
+dependencies = [
+ "affine-aime",
+ "affine-chuni",
+ "affine-core",
+ "affine-mai2",
+ "affine-mercury",
+]
+
+[[package]]
+name = "affine-mai2"
+version = "0.1.0"
+dependencies = [
+ "affine-core",
+]
+
+[[package]]
+name = "affine-mercury"
+version = "0.1.0"
+dependencies = [
+ "affine-core",
 ]
 
 [[package]]
