@@ -343,6 +343,20 @@ impl Mai2Runtime {
 
         self.devices[board as usize].send(DeviceCommand::Billboard(payload));
     }
+
+    #[cfg(feature = "latency-bench")]
+    pub fn bench_inject_input(&self, player: u8, buttons0: u8, buttons1: u8, touch: [u8; 7]) {
+        let Some(device) = self.devices.get(player.saturating_sub(1) as usize) else {
+            return;
+        };
+
+        apply_device_frame(
+            device,
+            &self.shared,
+            Some([buttons0 & 0x0F, buttons0 & 0xF0, buttons1 & 0x3F]),
+            Some(touch),
+        );
+    }
 }
 
 fn device_thread(
@@ -490,24 +504,7 @@ fn device_thread(
             while let Some(frame) = try_parse_frame(&mut rx_buf, &mut rx_len) {
                 match frame {
                     ParsedFrame::Touch { buttons, touch } => {
-                        let mut snapshot = device.snapshot();
-                        snapshot.connected = true;
-                        if let Some(buttons) = buttons {
-                            snapshot.buttons0 = (buttons[0] & 0x0F) | (buttons[1] & 0xF0);
-                            snapshot.buttons1 = buttons[2] & 0x3F;
-                        }
-                        if let Some(touch) = touch {
-                            snapshot.touch = touch;
-                        }
-                        device.set_snapshot(snapshot);
-
-                        if device.touch_enabled.load(Ordering::SeqCst)
-                            && let Some(callback) = *shared.callback.lock().unwrap()
-                        {
-                            unsafe {
-                                callback(device.player, snapshot.touch.as_ptr());
-                            }
-                        }
+                        apply_device_frame(&device, &shared, buttons, touch);
                     }
                     ParsedFrame::BoardInfo(version) => {
                         board_info_pending = false;
@@ -678,6 +675,32 @@ fn send_frame(port: &mut SerialPort, cmd: u8, payload: &[u8]) -> bool {
 fn interpolate(start: u8, end: u8, progress: f32) -> u8 {
     let delta = end as f32 - start as f32;
     (start as f32 + delta * progress).clamp(0.0, 255.0) as u8
+}
+
+fn apply_device_frame(
+    device: &DeviceHandle,
+    shared: &SharedState,
+    buttons: Option<[u8; 3]>,
+    touch: Option<[u8; 7]>,
+) {
+    let mut snapshot = device.snapshot();
+    snapshot.connected = true;
+    if let Some(buttons) = buttons {
+        snapshot.buttons0 = (buttons[0] & 0x0F) | (buttons[1] & 0xF0);
+        snapshot.buttons1 = buttons[2] & 0x3F;
+    }
+    if let Some(touch) = touch {
+        snapshot.touch = touch;
+    }
+    device.set_snapshot(snapshot);
+
+    if device.touch_enabled.load(Ordering::SeqCst)
+        && let Some(callback) = *shared.callback.lock().unwrap()
+    {
+        unsafe {
+            callback(device.player, snapshot.touch.as_ptr());
+        }
+    }
 }
 
 fn map_buttons(buttons0: u8, buttons1: u8) -> u16 {

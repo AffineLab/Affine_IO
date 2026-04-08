@@ -21,6 +21,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Environment",
     "Win32_System_IO",
     "Win32_System_Memory",
+    "Win32_System_Performance",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
@@ -37,9 +38,19 @@ edition = "2024"
 name = "affine_io"
 crate-type = ["cdylib"]
 
+[features]
+latency-bench = [
+    "affine-chuni/latency-bench",
+    "affine-mai2/latency-bench",
+    "affine-mercury/latency-bench",
+]
+
 [dependencies]
 affine-core = { path = "crates/affine-core" }
 affine-aime = { path = "crates/affine-aime" }
 affine-mai2 = { path = "crates/affine-mai2" }
 affine-chuni = { path = "crates/affine-chuni" }
 affine-mercury = { path = "crates/affine-mercury" }
+
+[dev-dependencies]
+windows-sys = { workspace = true }

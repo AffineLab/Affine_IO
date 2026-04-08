@@ -96,6 +96,11 @@ impl ChuniRuntime {
     pub fn coin_counter(&self) -> u16 {
         0
     }
+
+    #[cfg(feature = "latency-bench")]
+    pub fn bench_inject_input(&self, pressure: [u8; 32], beams: u8) {
+        apply_scan_frame(self, pressure, Some(beams));
+    }
 }
 
 fn chuni_thread(runtime: Arc<ChuniRuntime>, rx: Receiver<ChuniCommand>) {
@@ -201,11 +206,8 @@ fn chuni_thread(runtime: Arc<ChuniRuntime>, rx: Receiver<ChuniCommand>) {
                         if packet.payload.len() >= 32 {
                             let mut pressure = [0u8; 32];
                             pressure.copy_from_slice(&packet.payload[..32]);
-                            *runtime.pressure.lock().unwrap() = pressure;
-                            if packet.payload.len() >= 33 {
-                                *runtime.beams.lock().unwrap() = packet.payload[32];
-                            }
-                            invoke_callback(&runtime, &pressure);
+                            let beams = packet.payload.get(32).copied();
+                            apply_scan_frame(&runtime, pressure, beams);
                         }
                     }
                     SLIDER_CMD_AUTO_AIR => {
@@ -218,6 +220,14 @@ fn chuni_thread(runtime: Arc<ChuniRuntime>, rx: Receiver<ChuniCommand>) {
             }
         }
     }
+}
+
+fn apply_scan_frame(runtime: &ChuniRuntime, pressure: [u8; 32], beams: Option<u8>) {
+    *runtime.pressure.lock().unwrap() = pressure;
+    if let Some(beams) = beams {
+        *runtime.beams.lock().unwrap() = beams;
+    }
+    invoke_callback(runtime, &pressure);
 }
 
 fn invoke_callback(runtime: &ChuniRuntime, pressure: &[u8; 32]) {

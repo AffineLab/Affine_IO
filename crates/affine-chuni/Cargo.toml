@@ -3,5 +3,8 @@ name = "affine-chuni"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+latency-bench = []
+
 [dependencies]
 affine-core = { path = "../affine-core" }

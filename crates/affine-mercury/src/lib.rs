@@ -67,6 +67,11 @@ impl MercuryRuntime {
     }
 
     pub fn set_leds(&self, _data: MercuryLedData) {}
+
+    #[cfg(feature = "latency-bench")]
+    pub fn bench_inject_input(&self, cells: [bool; 240]) {
+        apply_cells_frame(self, cells);
+    }
 }
 
 fn mercury_thread(runtime: Arc<MercuryRuntime>, rx: Receiver<MercuryCommand>) {
@@ -140,10 +145,14 @@ fn mercury_thread(runtime: Arc<MercuryRuntime>, rx: Receiver<MercuryCommand>) {
                         cells[index * 8 + bit] = value & (1 << bit) != 0;
                     }
                 }
-                invoke_callback(&runtime, &cells);
+                apply_cells_frame(&runtime, cells);
             }
         }
     }
+}
+
+fn apply_cells_frame(runtime: &MercuryRuntime, cells: [bool; 240]) {
+    invoke_callback(runtime, &cells);
 }
 
 fn invoke_callback(runtime: &MercuryRuntime, cells: &[bool; 240]) {

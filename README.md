@@ -40,6 +40,14 @@ GitHub Actions now includes:
 - `Build`: release DLL builds for both `x64` and `x86`, packaging only
   `affine_io.dll`
 
+## Latency benchmark
+
+A Windows-only end-to-end latency benchmark is available as an example binary.
+It measures the in-process path from decoded synthetic device input to the
+game-visible poll/callback surface for `mai2`, `chuni`, and `mercury`.
+
+- Run: `cargo run --example e2e_latency_bench --features latency-bench`
+
 ## Commercial use
 
 Please contact the author before any commercial use.
