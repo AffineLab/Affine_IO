@@ -47,10 +47,20 @@ GitHub Actions now includes:
 ## Latency benchmark
 
 A Windows-only end-to-end latency benchmark is available as an example binary.
-It measures the in-process path from decoded synthetic device input to the
-game-visible poll/callback surface for `mai2`, `chuni`, and `mercury`.
+By default it talks to benchmark-enabled Affine STM32 firmware over serial and
+measures:
+
+- host-observed round-trip time
+- device-side handling time from `t_rx` to `t_tx`
+- host-minus-device time as a quick transport/stack estimate
 
 - Run: `cargo run --example e2e_latency_bench --features latency-bench`
+- Iterations: `cargo run --example e2e_latency_bench --features latency-bench -- --iterations=1000`
+- Synthetic-only extras: append `--synthetic`
+
+The hardware mode currently expects the benchmark firmware command `0x22` on the
+`Mai_stm32` and `Chunithm_Stm32` boards. `--synthetic` keeps the old in-process
+callback/poll measurements for `mai2`, `chuni`, and `mercury`.
 
 ## Commercial use
 
