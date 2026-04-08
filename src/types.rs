@@ -1,0 +1,84 @@
+use core::ffi::c_void;
+
+pub type Hresult = windows_sys::core::HRESULT;
+
+pub const S_OK: Hresult = 0;
+pub const S_FALSE: Hresult = 1;
+pub const E_FAIL: Hresult = 0x8000_4005u32 as i32;
+pub const E_NOTIMPL: Hresult = 0x8000_4001u32 as i32;
+pub const E_INVALIDARG: Hresult = 0x8007_0057u32 as i32;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct AimeIoVfdState {
+    pub encoding: u8,
+    pub text_speed: u8,
+    pub scroll_enabled: u8,
+    pub h_scroll: u16,
+    pub cursor_x: u16,
+    pub cursor_y: u8,
+    pub wnd_x0: u16,
+    pub wnd_y0: u8,
+    pub wnd_x1: u16,
+    pub wnd_y1: u8,
+    pub rotate: u8,
+    pub brightness: u8,
+    pub screen_on: u8,
+    pub clear_seq: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MercuryLedData {
+    pub unitCount: u32,
+    pub rgba: [u8; 480 * 4],
+}
+
+impl Default for MercuryLedData {
+    fn default() -> Self {
+        Self {
+            unitCount: 0,
+            rgba: [0; 480 * 4],
+        }
+    }
+}
+
+pub type Mai2TouchCallback = Option<unsafe extern "C" fn(player: u8, state: *const u8)>;
+pub type ChuniSliderCallback = Option<unsafe extern "C" fn(state: *const u8)>;
+pub type MercuryTouchCallback = Option<unsafe extern "C" fn(state: *const bool)>;
+
+pub unsafe fn write_value<T: Copy>(dst: *mut T, value: T) {
+    if let Some(dst) = unsafe { dst.as_mut() } {
+        *dst = value;
+    }
+}
+
+pub unsafe fn write_bytes(dst: *mut u8, src: &[u8]) -> bool {
+    if dst.is_null() {
+        return false;
+    }
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+    }
+
+    true
+}
+
+pub unsafe fn read_bytes<'a>(src: *const u8, len: usize) -> Option<&'a [u8]> {
+    if src.is_null() {
+        return None;
+    }
+
+    Some(unsafe { core::slice::from_raw_parts(src, len) })
+}
+
+pub unsafe fn read_mut_bytes<'a>(src: *mut u8, len: usize) -> Option<&'a mut [u8]> {
+    if src.is_null() {
+        return None;
+    }
+
+    Some(unsafe { core::slice::from_raw_parts_mut(src, len) })
+}
+
+pub type VoidPtr = *mut c_void;
