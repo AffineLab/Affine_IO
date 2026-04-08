@@ -8,12 +8,17 @@ use affine_core::types::{Hresult, Mai2TouchCallback, S_OK};
 use affine_core::util::{
     current_exe_name, ini_get_bool, log_line, segatools_config_path, sleep_ms, tick_ms,
 };
+use hidapi::HidApi;
 
 const AFFINE_VID: u16 = 0xAFF1;
 const MAI2_PID_1P: u16 = 0x52A5;
 const MAI2_PID_2P: u16 = 0x52A6;
 const AFFINE_CMD_HEARTBEAT: u8 = 0x11;
 const AFFINE_CMD_GET_BOARD_INFO: u8 = 0xF0;
+const MAI2_HID_USAGE_PAGE: u16 = 0xFFCA;
+const MAI2_HID_USAGE: u16 = 0x0001;
+const MAI2_HID_REPORT_LEN: usize = 8;
+const MAI2_HID_READ_TIMEOUT_MS: i32 = 1000;
 
 const AFFINE_HEARTBEAT_INTERVAL_MS: u64 = 100;
 const AFFINE_RESCAN_INTERVAL_MS: u64 = 500;
@@ -124,6 +129,7 @@ struct DeviceHandle {
     player: u8,
     pid: u16,
     enabled: AtomicBool,
+    hid_connected: AtomicBool,
     input_page: SharedPage<Mai2InputPage>,
     output_page: SharedPage<Mai2OutputPage>,
 }
@@ -149,6 +155,7 @@ impl DeviceHandle {
             player,
             pid,
             enabled: AtomicBool::new(enabled),
+            hid_connected: AtomicBool::new(false),
             input_page,
             output_page,
         })
@@ -216,7 +223,10 @@ impl Mai2Runtime {
         for device in &self.devices {
             let device = device.clone();
             let shared = self.shared.clone();
-            thread::spawn(move || device_thread(device, shared));
+            let serial_device = device.clone();
+            let serial_shared = shared.clone();
+            thread::spawn(move || device_thread(serial_device, serial_shared));
+            thread::spawn(move || hid_thread(device, shared));
         }
 
         log_line("[Affine IO] Initialization complete.");
@@ -561,7 +571,14 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
                         io_status,
                         touch,
                     } => {
-                        apply_device_frame(&device, &shared, buttons0, io_status, touch);
+                        let use_serial_buttons = !device.hid_connected.load(Ordering::SeqCst);
+                        apply_device_frame(
+                            &device,
+                            &shared,
+                            if use_serial_buttons { buttons0 } else { None },
+                            if use_serial_buttons { io_status } else { None },
+                            touch,
+                        );
                     }
                     ParsedFrame::BoardInfo(version) => {
                         board_info_pending = false;
@@ -574,6 +591,79 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
                 }
             }
         }
+    }
+}
+
+fn hid_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
+    let mut last_scan_log = 0u64;
+
+    loop {
+        if !device.enabled.load(Ordering::SeqCst) {
+            device.hid_connected.store(false, Ordering::SeqCst);
+            sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
+            continue;
+        }
+
+        let Ok(api) = HidApi::new() else {
+            let now = tick_ms();
+            if now.saturating_sub(last_scan_log) >= 5_000 {
+                log_line(&format!(
+                    "[Affine IO] P{}: HID subsystem unavailable",
+                    device.player
+                ));
+                last_scan_log = now;
+            }
+            sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
+            continue;
+        };
+
+        let Some(path) = find_hid_path(&api, AFFINE_VID, device.pid) else {
+            let now = tick_ms();
+            if now.saturating_sub(last_scan_log) >= 5_000 {
+                log_line(&format!(
+                    "[Affine IO] P{}: HID button interface not found (VID_{AFFINE_VID:04X} PID_{:04X})",
+                    device.player, device.pid
+                ));
+                last_scan_log = now;
+            }
+            sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
+            continue;
+        };
+
+        let path_display = path.to_string_lossy().into_owned();
+        let Ok(hid) = api.open_path(&path) else {
+            let now = tick_ms();
+            if now.saturating_sub(last_scan_log) >= 5_000 {
+                log_line(&format!(
+                    "[Affine IO] P{}: Failed to open HID path {}",
+                    device.player, path_display
+                ));
+                last_scan_log = now;
+            }
+            sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
+            continue;
+        };
+
+        log_line(&format!(
+            "[Affine IO] Connected P{} HID buttons: {}",
+            device.player, path_display
+        ));
+        device.hid_connected.store(true, Ordering::SeqCst);
+
+        loop {
+            let mut report = [0u8; MAI2_HID_REPORT_LEN];
+            match hid.read_timeout(&mut report, MAI2_HID_READ_TIMEOUT_MS) {
+                Ok(0) => continue,
+                Ok(read) if read >= 2 => {
+                    apply_device_frame(&device, &shared, Some(report[0]), Some(report[1]), None);
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+
+        device.hid_connected.store(false, Ordering::SeqCst);
+        sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
     }
 }
 
@@ -747,6 +837,7 @@ fn apply_device_frame(
     io_status: Option<u8>,
     touch: Option<[u8; 7]>,
 ) {
+    let touch_changed = touch.is_some();
     let (touch_copy, touch_enabled) = device.input_page.update(|page| {
         page.connected = 1;
         if let Some(buttons0) = buttons0 {
@@ -763,7 +854,10 @@ fn apply_device_frame(
         (page.touch, device.output_page.read().touch_enabled != 0)
     });
 
-    if touch_enabled && let Some(callback) = *shared.callback.lock().unwrap() {
+    if touch_changed
+        && touch_enabled
+        && let Some(callback) = *shared.callback.lock().unwrap()
+    {
         unsafe {
             callback(device.player, touch_copy.as_ptr());
         }
@@ -802,4 +896,15 @@ fn map_buttons(buttons0: u8, buttons1: u8) -> u16 {
     }
 
     out
+}
+
+fn find_hid_path(api: &HidApi, vid: u16, pid: u16) -> Option<std::ffi::CString> {
+    api.device_list()
+        .find(|info| {
+            info.vendor_id() == vid
+                && info.product_id() == pid
+                && info.usage_page() == MAI2_HID_USAGE_PAGE
+                && info.usage() == MAI2_HID_USAGE
+        })
+        .map(|info| info.path().to_owned())
 }
