@@ -53,4 +53,5 @@ affine-chuni = { path = "crates/affine-chuni" }
 affine-mercury = { path = "crates/affine-mercury" }
 
 [dev-dependencies]
+hidapi = "2.6.3"
 windows-sys = { workspace = true }

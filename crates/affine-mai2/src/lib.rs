@@ -17,7 +17,7 @@ const AFFINE_CMD_HEARTBEAT: u8 = 0x11;
 const AFFINE_CMD_GET_BOARD_INFO: u8 = 0xF0;
 const MAI2_HID_USAGE_PAGE: u16 = 0xFFCA;
 const MAI2_HID_USAGE: u16 = 0x0001;
-const MAI2_HID_REPORT_LEN: usize = 8;
+const MAI2_HID_REPORT_LEN: usize = 16;
 const MAI2_HID_READ_TIMEOUT_MS: i32 = 1000;
 
 const AFFINE_HEARTBEAT_INTERVAL_MS: u64 = 100;
@@ -655,6 +655,9 @@ fn hid_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
             match hid.read_timeout(&mut report, MAI2_HID_READ_TIMEOUT_MS) {
                 Ok(0) => continue,
                 Ok(read) if read >= 2 => {
+                    if read >= MAI2_HID_REPORT_LEN && report[1] == 0xFF {
+                        continue;
+                    }
                     apply_device_frame(&device, &shared, Some(report[0]), Some(report[1]), None);
                 }
                 Ok(_) => continue,

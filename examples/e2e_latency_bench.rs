@@ -9,6 +9,7 @@ mod bench {
     use affine_core::slider::{SliderParser, find_any, send_slider_frame};
     use affine_mai2::runtime as mai2_runtime;
     use affine_mercury::runtime as mercury_runtime;
+    use hidapi::{HidApi, HidDevice};
 
     const AFFINE_VID: u16 = 0xAFF1;
     const MAI2_PID_1P: u16 = 0x52A5;
@@ -17,10 +18,14 @@ mod bench {
     const SERIAL_BAUD: u32 = 115_200;
     const BENCHMARK_CMD: u8 = 0x22;
     const BENCHMARK_EVENT_CMD: u8 = 0x23;
+    const BENCHMARK_HID_EVENT_CMD: u8 = 0x24;
     const DEFAULT_ITERATIONS: usize = 500;
     const MAX_READ_SPINS: usize = 4;
     const ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(1);
     const EVENT_DELAY_MS: u32 = 10;
+    const MAI2_HID_USAGE_PAGE: u16 = 0xFFCA;
+    const MAI2_HID_USAGE: u16 = 0x0001;
+    const MAI2_HID_REPORT_LEN: usize = 16;
 
     static MAI2_CALLBACKS: AtomicU64 = AtomicU64::new(0);
     static CHUNI_CALLBACKS: AtomicU64 = AtomicU64::new(0);
@@ -153,7 +158,7 @@ mod bench {
             return false;
         };
 
-        bench_serial_device(label, &path, protocol, iterations, frequency);
+        bench_serial_device(label, &path, protocol, Some(pid), iterations, frequency);
         true
     }
 
@@ -168,7 +173,7 @@ mod bench {
             return false;
         };
 
-        bench_serial_device(label, &path, protocol, iterations, frequency);
+        bench_serial_device(label, &path, protocol, None, iterations, frequency);
         true
     }
 
@@ -176,6 +181,7 @@ mod bench {
         label: &str,
         path: &str,
         protocol: Protocol,
+        pid: Option<u16>,
         iterations: usize,
         frequency: f64,
     ) {
@@ -263,6 +269,16 @@ mod bench {
                 frequency,
                 &clock_offset_samples_us,
             );
+            if let Some(pid) = pid {
+                bench_mai2_hid_event_oneway(
+                    label,
+                    pid,
+                    &mut port,
+                    iterations,
+                    frequency,
+                    &clock_offset_samples_us,
+                );
+            }
         }
         port.close();
     }
@@ -322,6 +338,81 @@ mod bench {
             event_to_host_samples_us,
         );
         sample_stats_us(&format!("{label}-tx-to-host-cal"), tx_to_host_samples_us);
+    }
+
+    fn bench_mai2_hid_event_oneway(
+        label: &str,
+        pid: u16,
+        port: &mut SerialPort,
+        iterations: usize,
+        frequency: f64,
+        clock_offset_samples_us: &[f64],
+    ) {
+        let Some(clock_offset_us) = robust_median(clock_offset_samples_us) else {
+            return;
+        };
+
+        let Ok(api) = HidApi::new() else {
+            println!("{label}: hid benchmark unavailable (hidapi init failed)");
+            return;
+        };
+        let Some(hid_path) = find_hid_path(&api, AFFINE_VID, pid) else {
+            println!("{label}: hid benchmark unavailable (hid path not found)");
+            return;
+        };
+        let Ok(hid) = api.open_path(&hid_path) else {
+            println!("{label}: hid benchmark unavailable (hid open failed)");
+            return;
+        };
+
+        drain_hid(&hid);
+
+        let mut event_to_host_samples_us = Vec::with_capacity(iterations);
+        let mut tx_to_host_samples_us = Vec::with_capacity(iterations);
+
+        for sequence in 0..iterations {
+            let payload = make_event_arm_payload(sequence as u32, EVENT_DELAY_MS);
+            if !send_mai2_frame(port, BENCHMARK_HID_EVENT_CMD, &payload) {
+                println!("{label}: hid event write failed on iteration {sequence}");
+                break;
+            }
+
+            let reply = match read_mai2_hid_event_reply(&hid, sequence as u16) {
+                Some(reply) => reply,
+                None => {
+                    println!(
+                        "{label}: timeout waiting for hid event reply; check firmware hid benchmark support"
+                    );
+                    break;
+                }
+            };
+
+            let recv_us = ticks_to_us(perf_counter(), frequency);
+            let event_host_est_us =
+                clock_offset_us + cycles_to_us(reply.event_cycles, reply.core_hz);
+            let tx_host_est_us = clock_offset_us + cycles_to_us(reply.tx_cycles, reply.core_hz);
+
+            event_to_host_samples_us.push((recv_us - event_host_est_us).max(0.0));
+            tx_to_host_samples_us.push((recv_us - tx_host_est_us).max(0.0));
+        }
+
+        if event_to_host_samples_us.is_empty() {
+            return;
+        }
+
+        println!(
+            "{label}: hid-event-samples={} event-delay={}ms clock-offset={clock_offset_us:.3}us",
+            event_to_host_samples_us.len(),
+            EVENT_DELAY_MS
+        );
+        sample_stats_us(
+            &format!("{label}-hid-event-to-host-cal"),
+            event_to_host_samples_us,
+        );
+        sample_stats_us(
+            &format!("{label}-hid-tx-to-host-cal"),
+            tx_to_host_samples_us,
+        );
     }
 
     fn send_benchmark_request(port: &mut SerialPort, protocol: Protocol, payload: &[u8]) -> bool {
@@ -500,6 +591,36 @@ mod bench {
         None
     }
 
+    fn read_mai2_hid_event_reply(hid: &HidDevice, expected_sequence: u16) -> Option<EventReply> {
+        let deadline = Instant::now() + ROUNDTRIP_TIMEOUT;
+        let mut report = [0u8; MAI2_HID_REPORT_LEN];
+
+        while Instant::now() < deadline {
+            match hid.read_timeout(&mut report, 50) {
+                Ok(read) if read >= MAI2_HID_REPORT_LEN => {
+                    if report[1] != 0xFF {
+                        continue;
+                    }
+
+                    let sequence = u16::from_le_bytes([report[2], report[3]]);
+                    if sequence != expected_sequence {
+                        continue;
+                    }
+
+                    return Some(EventReply {
+                        event_cycles: read_u32_le(&report[4..8]),
+                        tx_cycles: read_u32_le(&report[8..12]),
+                        core_hz: read_u32_le(&report[12..16]),
+                    });
+                }
+                Ok(_) => continue,
+                Err(_) => return None,
+            }
+        }
+
+        None
+    }
+
     fn parse_mai2_frame(rx_buf: &mut [u8; 256], rx_len: &mut usize) -> Option<(u8, Vec<u8>)> {
         while *rx_len > 0 && rx_buf[0] != 0xFF {
             consume(rx_buf, rx_len, 1);
@@ -542,6 +663,16 @@ mod bench {
         }
     }
 
+    fn drain_hid(hid: &HidDevice) {
+        let mut buf = [0u8; MAI2_HID_REPORT_LEN];
+        for _ in 0..MAX_READ_SPINS {
+            match hid.read_timeout(&mut buf, 1) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
+
     fn make_benchmark_payload(sequence: u64) -> [u8; 16] {
         let mut payload = [0u8; 16];
         payload[..8].copy_from_slice(&sequence.to_le_bytes());
@@ -558,6 +689,17 @@ mod bench {
 
     fn read_u32_le(raw: &[u8]) -> u32 {
         u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])
+    }
+
+    fn find_hid_path(api: &HidApi, vid: u16, pid: u16) -> Option<std::ffi::CString> {
+        api.device_list()
+            .find(|info| {
+                info.vendor_id() == vid
+                    && info.product_id() == pid
+                    && info.usage_page() == MAI2_HID_USAGE_PAGE
+                    && info.usage() == MAI2_HID_USAGE
+            })
+            .map(|info| info.path().to_owned())
     }
 
     fn send_mai2_frame(port: &mut SerialPort, cmd: u8, payload: &[u8]) -> bool {

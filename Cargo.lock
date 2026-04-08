@@ -32,6 +32,7 @@ dependencies = [
  "affine-core",
  "affine-mai2",
  "affine-mercury",
+ "hidapi",
  "windows-sys",
 ]
 
