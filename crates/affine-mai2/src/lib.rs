@@ -6,9 +6,10 @@ use affine_core::serial::{SerialPort, find_com_port};
 use affine_core::shared_memory::SharedPage;
 use affine_core::types::{Hresult, Mai2TouchCallback, S_OK};
 use affine_core::util::{
-    current_exe_name, ini_get_bool, log_line, segatools_config_path, sleep_ms, tick_ms,
+    current_exe_name, ini_get_bool, ini_get_u32, log_line, segatools_config_path, sleep_ms, tick_ms,
 };
 use hidapi::HidApi;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F1, VK_F2, VK_F3};
 
 const AFFINE_VID: u16 = 0xAFF1;
 const MAI2_PID_1P: u16 = 0x52A5;
@@ -105,6 +106,23 @@ struct LedFade {
     duration: u64,
 }
 
+#[derive(Clone, Copy)]
+struct KeyboardConfig {
+    vk_test: u16,
+    vk_service: u16,
+    vk_coin: u16,
+}
+
+impl Default for KeyboardConfig {
+    fn default() -> Self {
+        Self {
+            vk_test: VK_F1,
+            vk_service: VK_F2,
+            vk_coin: VK_F3,
+        }
+    }
+}
+
 #[derive(Default)]
 struct LedState {
     fades: [[LedFade; 8]; 2],
@@ -166,6 +184,7 @@ pub struct Mai2Runtime {
     shared: Arc<SharedState>,
     devices: [Arc<DeviceHandle>; 2],
     poll_page: SharedPage<Mai2PollPage>,
+    keyboard: KeyboardConfig,
     initialized: AtomicBool,
     led_started: AtomicBool,
 }
@@ -181,9 +200,18 @@ impl Mai2Runtime {
         let config_path = segatools_config_path();
         let p1_enabled = ini_get_bool(&config_path, "touch", "p1Enable", true);
         let p2_enabled = ini_get_bool(&config_path, "touch", "p2Enable", true);
+        let keyboard = KeyboardConfig {
+            vk_test: ini_get_u32(&config_path, "io4", "test", VK_F1 as u32) as u16,
+            vk_service: ini_get_u32(&config_path, "io4", "service", VK_F2 as u32) as u16 as u16,
+            vk_coin: ini_get_u32(&config_path, "io4", "coin", VK_F3 as u32) as u16,
+        };
         log_line(&format!(
             "[Affine IO] Config: p1Enable={} p2Enable={}",
             p1_enabled as u8, p2_enabled as u8
+        ));
+        log_line(&format!(
+            "[Affine IO] Keyboard opbtn fallback: test=0x{:X} service=0x{:X} coin=0x{:X}",
+            keyboard.vk_test, keyboard.vk_service, keyboard.vk_coin
         ));
 
         let shared = Arc::new(SharedState::new());
@@ -197,6 +225,7 @@ impl Mai2Runtime {
             shared,
             devices: [p1, p2],
             poll_page,
+            keyboard,
             initialized: AtomicBool::new(false),
             led_started: AtomicBool::new(false),
         })
@@ -274,6 +303,16 @@ impl Mai2Runtime {
                 if p2.io_status & (1 << MAI2_AFFINE_EXT_SERVICE_BIT) != 0 {
                     opbtn |= MAI2_IO_OPBTN_SERVICE;
                 }
+            }
+
+            if key_down(self.keyboard.vk_test) {
+                opbtn |= MAI2_IO_OPBTN_TEST;
+            }
+            if key_down(self.keyboard.vk_service) {
+                opbtn |= MAI2_IO_OPBTN_SERVICE;
+            }
+            if key_down(self.keyboard.vk_coin) {
+                opbtn |= MAI2_IO_OPBTN_COIN;
             }
 
             poll_state.opbtn = opbtn;
@@ -912,6 +951,14 @@ fn map_buttons(buttons0: u8, buttons1: u8) -> u16 {
     }
 
     out
+}
+
+fn key_down(vk: u16) -> bool {
+    if vk == 0 {
+        return false;
+    }
+
+    unsafe { (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 }
 }
 
 fn find_hid_path(api: &HidApi, vid: u16, pid: u16) -> Option<std::ffi::CString> {

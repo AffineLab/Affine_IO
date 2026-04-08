@@ -9,3 +9,4 @@ latency-bench = []
 [dependencies]
 affine-core = { path = "../affine-core" }
 hidapi = "2.6.3"
+windows-sys = { workspace = true }

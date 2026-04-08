@@ -42,6 +42,7 @@ version = "0.1.0"
 dependencies = [
  "affine-core",
  "hidapi",
+ "windows-sys",
 ]
 
 [[package]]

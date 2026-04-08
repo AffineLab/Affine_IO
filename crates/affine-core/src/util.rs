@@ -74,6 +74,44 @@ pub fn ini_get_bool(path: &Path, section: &str, key: &str, default: bool) -> boo
     default
 }
 
+pub fn ini_get_u32(path: &Path, section: &str, key: &str, default: u32) -> u32 {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return default;
+    };
+
+    let mut current_section = String::new();
+
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+
+        if line.starts_with('[') && line.ends_with(']') {
+            current_section.clear();
+            current_section.push_str(line[1..line.len() - 1].trim());
+            continue;
+        }
+
+        if !current_section.eq_ignore_ascii_case(section) {
+            continue;
+        }
+
+        let Some((raw_key, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+
+        if !raw_key.trim().eq_ignore_ascii_case(key) {
+            continue;
+        }
+
+        return parse_u32(raw_value.trim()).unwrap_or(default);
+    }
+
+    default
+}
+
 pub fn current_exe_name() -> Option<String> {
     std::env::current_exe().ok().and_then(|path| {
         path.file_name()
@@ -106,5 +144,16 @@ fn parse_bool(value: &str) -> Option<bool> {
         Some(false)
     } else {
         None
+    }
+}
+
+fn parse_u32(value: &str) -> Option<u32> {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        value.parse::<u32>().ok()
     }
 }
