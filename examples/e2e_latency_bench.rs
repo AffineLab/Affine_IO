@@ -37,6 +37,12 @@ mod bench {
         core_hz: u32,
     }
 
+    #[derive(Clone, Copy)]
+    enum Protocol {
+        Mai2,
+        Slider,
+    }
+
     pub fn run() {
         let config = parse_args();
         let frequency = perf_frequency();
@@ -48,12 +54,27 @@ mod bench {
 
         if !config.synthetic_only {
             let mut ran_hardware = false;
-            ran_hardware |=
-                bench_device_by_pid("mai2-p1", MAI2_PID_1P, config.iterations, frequency);
-            ran_hardware |=
-                bench_device_by_pid("mai2-p2", MAI2_PID_2P, config.iterations, frequency);
-            ran_hardware |=
-                bench_device_by_any_pid("chuni-slider", &CHUNI_PIDS, config.iterations, frequency);
+            ran_hardware |= bench_device_by_pid(
+                "mai2-p1",
+                MAI2_PID_1P,
+                Protocol::Mai2,
+                config.iterations,
+                frequency,
+            );
+            ran_hardware |= bench_device_by_pid(
+                "mai2-p2",
+                MAI2_PID_2P,
+                Protocol::Mai2,
+                config.iterations,
+                frequency,
+            );
+            ran_hardware |= bench_device_by_any_pid(
+                "chuni-slider",
+                &CHUNI_PIDS,
+                Protocol::Slider,
+                config.iterations,
+                frequency,
+            );
 
             if !ran_hardware {
                 println!("no benchmark-capable firmware device detected");
@@ -113,18 +134,25 @@ mod bench {
         config
     }
 
-    fn bench_device_by_pid(label: &str, pid: u16, iterations: usize, frequency: f64) -> bool {
+    fn bench_device_by_pid(
+        label: &str,
+        pid: u16,
+        protocol: Protocol,
+        iterations: usize,
+        frequency: f64,
+    ) -> bool {
         let Some(path) = find_com_port(AFFINE_VID, pid) else {
             return false;
         };
 
-        bench_serial_device(label, &path, iterations, frequency);
+        bench_serial_device(label, &path, protocol, iterations, frequency);
         true
     }
 
     fn bench_device_by_any_pid(
         label: &str,
         pids: &[u16],
+        protocol: Protocol,
         iterations: usize,
         frequency: f64,
     ) -> bool {
@@ -132,11 +160,17 @@ mod bench {
             return false;
         };
 
-        bench_serial_device(label, &path, iterations, frequency);
+        bench_serial_device(label, &path, protocol, iterations, frequency);
         true
     }
 
-    fn bench_serial_device(label: &str, path: &str, iterations: usize, frequency: f64) {
+    fn bench_serial_device(
+        label: &str,
+        path: &str,
+        protocol: Protocol,
+        iterations: usize,
+        frequency: f64,
+    ) {
         let mut port = SerialPort::default();
         if !port.open(path, SERIAL_BAUD) {
             println!("{label}: failed to open {path}");
@@ -153,16 +187,18 @@ mod bench {
             let payload = make_benchmark_payload(sequence as u64);
             let start = perf_counter();
 
-            if !send_slider_frame(&mut |frame| port.write(frame), BENCHMARK_CMD, &payload) {
+            if !send_benchmark_request(&mut port, protocol, &payload) {
                 println!("{label}: write failed on iteration {sequence}");
-                return;
+                break;
             }
 
-            let reply = match read_benchmark_reply(&mut port, &payload) {
+            let reply = match read_benchmark_reply(&mut port, protocol, &payload) {
                 Some(reply) => reply,
                 None => {
-                    println!("{label}: timeout waiting for benchmark reply");
-                    return;
+                    println!(
+                        "{label}: timeout waiting for benchmark reply; check firmware flash level and protocol"
+                    );
+                    break;
                 }
             };
 
@@ -178,13 +214,37 @@ mod bench {
             transit_samples_us.push((host_us - device_us).max(0.0));
         }
 
+        if host_samples_ticks.is_empty() {
+            return;
+        }
+
         println!("{label}: port={path}");
         sample_stats_ticks(&format!("{label}-rtt"), host_samples_ticks, frequency);
         sample_stats_us(&format!("{label}-device"), device_samples_us);
         sample_stats_us(&format!("{label}-host-minus-device"), transit_samples_us);
     }
 
+    fn send_benchmark_request(port: &mut SerialPort, protocol: Protocol, payload: &[u8]) -> bool {
+        match protocol {
+            Protocol::Mai2 => send_mai2_frame(port, BENCHMARK_CMD, payload),
+            Protocol::Slider => {
+                send_slider_frame(&mut |frame| port.write(frame), BENCHMARK_CMD, payload)
+            }
+        }
+    }
+
     fn read_benchmark_reply(
+        port: &mut SerialPort,
+        protocol: Protocol,
+        expected_payload: &[u8],
+    ) -> Option<BenchmarkReply> {
+        match protocol {
+            Protocol::Mai2 => read_mai2_benchmark_reply(port, expected_payload),
+            Protocol::Slider => read_slider_benchmark_reply(port, expected_payload),
+        }
+    }
+
+    fn read_slider_benchmark_reply(
         port: &mut SerialPort,
         expected_payload: &[u8],
     ) -> Option<BenchmarkReply> {
@@ -234,6 +294,93 @@ mod bench {
         None
     }
 
+    fn read_mai2_benchmark_reply(
+        port: &mut SerialPort,
+        expected_payload: &[u8],
+    ) -> Option<BenchmarkReply> {
+        let deadline = Instant::now() + ROUNDTRIP_TIMEOUT;
+        let mut buf = [0u8; 64];
+        let mut rx_buf = [0u8; 256];
+        let mut rx_len = 0usize;
+        let expected_len = expected_payload.len() + 12;
+        let mut idle_spins = 0usize;
+
+        while Instant::now() < deadline {
+            let read = match port.read(&mut buf) {
+                Some(read) => read,
+                None => return None,
+            };
+
+            if read == 0 {
+                idle_spins += 1;
+                if idle_spins >= MAX_READ_SPINS {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                continue;
+            }
+
+            idle_spins = 0;
+            let copy = read.min(rx_buf.len().saturating_sub(rx_len));
+            rx_buf[rx_len..rx_len + copy].copy_from_slice(&buf[..copy]);
+            rx_len += copy;
+
+            loop {
+                let Some(frame) = parse_mai2_frame(&mut rx_buf, &mut rx_len) else {
+                    break;
+                };
+
+                if frame.0 != BENCHMARK_CMD || frame.1.len() != expected_len {
+                    continue;
+                }
+
+                if &frame.1[..expected_payload.len()] != expected_payload {
+                    continue;
+                }
+
+                let meta = &frame.1[expected_payload.len()..];
+                return Some(BenchmarkReply {
+                    dispatch_cycles: read_u32_le(&meta[0..4]),
+                    tx_cycles: read_u32_le(&meta[4..8]),
+                    core_hz: read_u32_le(&meta[8..12]),
+                });
+            }
+        }
+
+        None
+    }
+
+    fn parse_mai2_frame(rx_buf: &mut [u8; 256], rx_len: &mut usize) -> Option<(u8, Vec<u8>)> {
+        while *rx_len > 0 && rx_buf[0] != 0xFF {
+            consume(rx_buf, rx_len, 1);
+        }
+
+        if *rx_len < 4 {
+            return None;
+        }
+
+        let total = rx_buf[2] as usize + 4;
+        if total > rx_buf.len() {
+            consume(rx_buf, rx_len, 1);
+            return None;
+        }
+        if *rx_len < total {
+            return None;
+        }
+
+        let checksum = rx_buf[..total - 1]
+            .iter()
+            .fold(0u8, |sum, &byte| sum.wrapping_add(byte));
+        if checksum != rx_buf[total - 1] {
+            consume(rx_buf, rx_len, 1);
+            return None;
+        }
+
+        let cmd = rx_buf[1];
+        let payload = rx_buf[3..total - 1].to_vec();
+        consume(rx_buf, rx_len, total);
+        Some((cmd, payload))
+    }
+
     fn drain_port(port: &mut SerialPort) {
         let mut buf = [0u8; 64];
         for _ in 0..MAX_READ_SPINS {
@@ -253,6 +400,27 @@ mod bench {
 
     fn read_u32_le(raw: &[u8]) -> u32 {
         u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])
+    }
+
+    fn send_mai2_frame(port: &mut SerialPort, cmd: u8, payload: &[u8]) -> bool {
+        let mut frame = Vec::with_capacity(payload.len() + 4);
+        frame.push(0xFF);
+        frame.push(cmd);
+        frame.push(payload.len() as u8);
+        frame.extend_from_slice(payload);
+        let checksum = frame.iter().fold(0u8, |sum, &byte| sum.wrapping_add(byte));
+        frame.push(checksum);
+        port.write(&frame)
+    }
+
+    fn consume(rx_buf: &mut [u8; 256], rx_len: &mut usize, count: usize) {
+        if count >= *rx_len {
+            *rx_len = 0;
+            return;
+        }
+
+        rx_buf.copy_within(count..*rx_len, 0);
+        *rx_len -= count;
     }
 
     fn cycles_to_us(cycles: u32, core_hz: u32) -> f64 {
