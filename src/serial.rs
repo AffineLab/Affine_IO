@@ -9,10 +9,9 @@ use windows_sys::Win32::Devices::Communication::{
 };
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, SP_DEVICE_INTERFACE_DATA,
-    SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA, SPDRP_FRIENDLYNAME,
-    SPDRP_HARDWAREID, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces,
-    SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
-    SetupDiGetDeviceRegistryPropertyW,
+    SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA, SPDRP_FRIENDLYNAME, SPDRP_HARDWAREID,
+    SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
+    SetupDiGetDeviceInterfaceDetailW, SetupDiGetDeviceRegistryPropertyW,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_DEVICE_NOT_CONNECTED, ERROR_INVALID_HANDLE, ERROR_NO_MORE_ITEMS,
@@ -45,7 +44,7 @@ impl Default for SerialPort {
 
 impl SerialPort {
     pub fn is_open(&self) -> bool {
-        self.handle != null_mut() && self.handle != INVALID_HANDLE_VALUE
+        !self.handle.is_null() && self.handle != INVALID_HANDLE_VALUE
     }
 
     pub fn open(&mut self, path: &str, baud: u32) -> bool {
@@ -78,8 +77,8 @@ impl SerialPort {
 
         dcb.BaudRate = baud;
         dcb.ByteSize = 8;
-        dcb.StopBits = ONESTOPBIT as u8;
-        dcb.Parity = NOPARITY as u8;
+        dcb.StopBits = ONESTOPBIT;
+        dcb.Parity = NOPARITY;
         if unsafe { SetCommState(handle, &dcb) } == 0 {
             unsafe {
                 CloseHandle(handle);

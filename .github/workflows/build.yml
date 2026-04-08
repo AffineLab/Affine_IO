@@ -1,0 +1,70 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: x64
+            binary_dir: target/x86_64-pc-windows-msvc/release
+          - target: i686-pc-windows-msvc
+            arch: x86
+            binary_dir: target/i686-pc-windows-msvc/release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-pc-windows-msvc
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release DLL
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Collect release artifacts
+        shell: pwsh
+        run: |
+          $dist = Join-Path $PWD "dist/windows-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+
+          $source = Join-Path $PWD "${{ matrix.binary_dir }}\\affine_io.dll"
+          if (-not (Test-Path -LiteralPath $source)) {
+            throw "Missing build output: $source"
+          }
+
+          $aliases = @(
+            'affine_io.dll',
+            'aimeio.dll',
+            'mai2io.dll',
+            'chuniio.dll',
+            'mercuryio.dll'
+          )
+
+          foreach ($alias in $aliases) {
+            Copy-Item -LiteralPath $source -Destination (Join-Path $dist $alias) -Force
+          }
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: affine-io-windows-${{ matrix.arch }}
+          path: dist/windows-${{ matrix.arch }}
+          if-no-files-found: error

@@ -1,6 +1,6 @@
 use std::sync::{Mutex, OnceLock};
 
-use crate::serial::{find_com_port, SerialPort};
+use crate::serial::{SerialPort, find_com_port};
 use crate::types::{E_FAIL, E_INVALIDARG, Hresult, S_FALSE, S_OK};
 use crate::util::log_line;
 
@@ -23,17 +23,17 @@ const SG_CMD_FELICA_ENCAP: u8 = 0x71;
 const SG_CMD_EXT_LED_RGB: u8 = 0x81;
 const SG_CMD_EXT_BOARD_INFO: u8 = 0xF0;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 enum CachedCard {
+    #[default]
     None,
-    Mifare { uid: [u8; 4] },
-    Felica { idm: [u8; 8], _pmm: [u8; 8] },
-}
-
-impl Default for CachedCard {
-    fn default() -> Self {
-        Self::None
-    }
+    Mifare {
+        uid: [u8; 4],
+    },
+    Felica {
+        idm: [u8; 8],
+        _pmm: [u8; 8],
+    },
 }
 
 struct Reader {
@@ -79,7 +79,10 @@ impl Reader {
             return false;
         }
 
-        log_line(&format!("[Affine IO] Monica reader connected: {}", path.trim_start_matches("\\\\.\\")));
+        log_line(&format!(
+            "[Affine IO] Monica reader connected: {}",
+            path.trim_start_matches("\\\\.\\")
+        ));
         true
     }
 
@@ -92,16 +95,16 @@ impl Reader {
             return S_OK;
         }
 
-        if let Ok(res) = self.transact(SG_CMD_GET_FW_VERSION, &[]) {
-            if let Ok(version) = String::from_utf8(res.payload) {
-                log_line(&format!("[Affine IO] Monica firmware: {version}"));
-            }
+        if let Ok(res) = self.transact(SG_CMD_GET_FW_VERSION, &[])
+            && let Ok(version) = String::from_utf8(res.payload)
+        {
+            log_line(&format!("[Affine IO] Monica firmware: {version}"));
         }
 
-        if let Ok(res) = self.transact(SG_CMD_GET_HW_VERSION, &[]) {
-            if let Ok(version) = String::from_utf8(res.payload) {
-                log_line(&format!("[Affine IO] Monica hardware: {version}"));
-            }
+        if let Ok(res) = self.transact(SG_CMD_GET_HW_VERSION, &[])
+            && let Ok(version) = String::from_utf8(res.payload)
+        {
+            log_line(&format!("[Affine IO] Monica hardware: {version}"));
         }
 
         let _ = self.transact(SG_CMD_EXT_BOARD_INFO, &[]);
@@ -345,7 +348,11 @@ pub fn mifare_read_block(unit_no: u8, uid: &[u8], block_no: u8, block: &mut [u8]
     payload[..4].copy_from_slice(uid);
     payload[4] = block_no;
 
-    match reader().lock().unwrap().transact(SG_CMD_MIFARE_READ_BLOCK, &payload) {
+    match reader()
+        .lock()
+        .unwrap()
+        .transact(SG_CMD_MIFARE_READ_BLOCK, &payload)
+    {
         Ok(response) if response.status == 0 && response.payload.len() >= 16 => {
             block.copy_from_slice(&response.payload[..16]);
             S_OK
@@ -394,16 +401,16 @@ pub fn send_hex_data(unit_no: u8, payload: &[u8], status_out: Option<&mut u8>) -
         return S_FALSE;
     }
 
-    match reader().lock().unwrap().transact(SG_CMD_SEND_HEX_DATA, payload) {
+    match reader()
+        .lock()
+        .unwrap()
+        .transact(SG_CMD_SEND_HEX_DATA, payload)
+    {
         Ok(response) => {
             if let Some(status_out) = status_out {
                 *status_out = response.status;
             }
-            if response.status == 0 {
-                S_OK
-            } else {
-                S_FALSE
-            }
+            if response.status == 0 { S_OK } else { S_FALSE }
         }
         Err(err) => err,
     }

@@ -3,7 +3,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
-use crate::serial::{find_com_port, SerialPort};
+use crate::serial::{SerialPort, find_com_port};
 use crate::types::{ChuniSliderCallback, Hresult, MercuryLedData, MercuryTouchCallback, S_OK};
 use crate::util::{log_line, sleep_ms};
 
@@ -81,11 +81,11 @@ pub fn mercury() -> &'static Arc<MercuryRuntime> {
 
 impl ChuniRuntime {
     pub fn init(&self) -> Hresult {
-        if !self.started.swap(true, Ordering::SeqCst) {
-            if let Some(rx) = self.rx.lock().unwrap().take() {
-                let runtime = chuni().clone();
-                thread::spawn(move || chuni_thread(runtime, rx));
-            }
+        if !self.started.swap(true, Ordering::SeqCst)
+            && let Some(rx) = self.rx.lock().unwrap().take()
+        {
+            let runtime = chuni().clone();
+            thread::spawn(move || chuni_thread(runtime, rx));
         }
         S_OK
     }
@@ -130,11 +130,11 @@ impl ChuniRuntime {
 
 impl MercuryRuntime {
     pub fn init(&self) -> Hresult {
-        if !self.started.swap(true, Ordering::SeqCst) {
-            if let Some(rx) = self.rx.lock().unwrap().take() {
-                let runtime = mercury().clone();
-                thread::spawn(move || mercury_thread(runtime, rx));
-            }
+        if !self.started.swap(true, Ordering::SeqCst)
+            && let Some(rx) = self.rx.lock().unwrap().take()
+        {
+            let runtime = mercury().clone();
+            thread::spawn(move || mercury_thread(runtime, rx));
         }
         S_OK
     }
@@ -173,13 +173,18 @@ fn chuni_thread(runtime: Arc<ChuniRuntime>, rx: Receiver<ChuniCommand>) {
 
             if !port.open(&path, 115_200) {
                 if should_log(&mut last_scan_log) {
-                    log_line(&format!("[Affine IO] Chunithm slider: failed to open {path}"));
+                    log_line(&format!(
+                        "[Affine IO] Chunithm slider: failed to open {path}"
+                    ));
                 }
                 sleep_ms(500);
                 continue;
             }
 
-            log_line(&format!("[Affine IO] Chunithm slider connected: {}", path.trim_start_matches("\\\\.\\")));
+            log_line(&format!(
+                "[Affine IO] Chunithm slider connected: {}",
+                path.trim_start_matches("\\\\.\\")
+            ));
 
             if runtime.active.load(Ordering::SeqCst) {
                 send_slider_command(&mut port, SLIDER_CMD_AUTO_AIR_START, &[]);
@@ -268,7 +273,10 @@ fn mercury_thread(runtime: Arc<MercuryRuntime>, rx: Receiver<MercuryCommand>) {
                 continue;
             }
 
-            log_line(&format!("[Affine IO] Mercury touch connected: {}", path.trim_start_matches("\\\\.\\")));
+            log_line(&format!(
+                "[Affine IO] Mercury touch connected: {}",
+                path.trim_start_matches("\\\\.\\")
+            ));
             if runtime.active.load(Ordering::SeqCst) {
                 send_slider_command(&mut port, SLIDER_CMD_AUTO_SCAN_START, &[]);
             }
@@ -295,16 +303,17 @@ fn mercury_thread(runtime: Arc<MercuryRuntime>, rx: Receiver<MercuryCommand>) {
         }
 
         for &byte in &buf[..read] {
-            if let Some(packet) = parser.push(byte) {
-                if packet.cmd == SLIDER_CMD_AUTO_SCAN && packet.payload.len() >= 30 {
-                    let mut cells = [false; 240];
-                    for (index, value) in packet.payload[..30].iter().enumerate() {
-                        for bit in 0..8 {
-                            cells[index * 8 + bit] = value & (1 << bit) != 0;
-                        }
+            if let Some(packet) = parser.push(byte)
+                && packet.cmd == SLIDER_CMD_AUTO_SCAN
+                && packet.payload.len() >= 30
+            {
+                let mut cells = [false; 240];
+                for (index, value) in packet.payload[..30].iter().enumerate() {
+                    for bit in 0..8 {
+                        cells[index * 8 + bit] = value & (1 << bit) != 0;
                     }
-                    invoke_mercury_callback(&runtime, &cells);
                 }
+                invoke_mercury_callback(&runtime, &cells);
             }
         }
     }

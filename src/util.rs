@@ -75,9 +75,10 @@ pub fn ini_get_bool(path: &Path, section: &str, key: &str, default: bool) -> boo
 }
 
 pub fn current_exe_name() -> Option<String> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+    std::env::current_exe().ok().and_then(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    })
 }
 
 fn parse_bool(value: &str) -> Option<bool> {

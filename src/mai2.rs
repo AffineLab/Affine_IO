@@ -3,9 +3,11 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
-use crate::serial::{find_com_port, SerialPort};
+use crate::serial::{SerialPort, find_com_port};
 use crate::types::{Hresult, Mai2TouchCallback, S_OK};
-use crate::util::{current_exe_name, ini_get_bool, log_line, segatools_config_path, sleep_ms, tick_ms};
+use crate::util::{
+    current_exe_name, ini_get_bool, log_line, segatools_config_path, sleep_ms, tick_ms,
+};
 
 const AFFINE_VID: u16 = 0xAFF1;
 const AFFINE_PID_1P: u16 = 0x52A5;
@@ -343,7 +345,11 @@ impl Mai2Runtime {
     }
 }
 
-fn device_thread(device: Arc<DeviceHandle>, receiver: Receiver<DeviceCommand>, shared: Arc<SharedState>) {
+fn device_thread(
+    device: Arc<DeviceHandle>,
+    receiver: Receiver<DeviceCommand>,
+    shared: Arc<SharedState>,
+) {
     let mut port = SerialPort::default();
     let mut rx_buf = [0u8; 128];
     let mut rx_len = 0usize;
@@ -381,14 +387,21 @@ fn device_thread(device: Arc<DeviceHandle>, receiver: Receiver<DeviceCommand>, s
             if !port.open(&port_path, 115_200) {
                 let now = tick_ms();
                 if now.saturating_sub(last_scan_log) >= 5_000 {
-                    log_line(&format!("[Affine IO] P{}: Failed to open port {port_path}", device.player));
+                    log_line(&format!(
+                        "[Affine IO] P{}: Failed to open port {port_path}",
+                        device.player
+                    ));
                     last_scan_log = now;
                 }
                 sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
                 continue;
             }
 
-            log_line(&format!("[Affine IO] Connected P{}: {}", device.player, port_path.trim_start_matches("\\\\.\\")));
+            log_line(&format!(
+                "[Affine IO] Connected P{}: {}",
+                device.player,
+                port_path.trim_start_matches("\\\\.\\")
+            ));
             device.set_snapshot(DeviceSnapshot {
                 connected: true,
                 ..Default::default()
@@ -404,7 +417,9 @@ fn device_thread(device: Arc<DeviceHandle>, receiver: Receiver<DeviceCommand>, s
         let now = tick_ms();
 
         if board_info_pending {
-            if board_info_request_ms == 0 && now.saturating_sub(board_info_start_ms) >= AFFINE_BOARD_INFO_DELAY_MS {
+            if board_info_request_ms == 0
+                && now.saturating_sub(board_info_start_ms) >= AFFINE_BOARD_INFO_DELAY_MS
+            {
                 if !send_frame(&mut port, AFFINE_CMD_GET_BOARD_INFO, &[]) {
                     port.close();
                     device.set_snapshot(DeviceSnapshot::default());
@@ -486,18 +501,21 @@ fn device_thread(device: Arc<DeviceHandle>, receiver: Receiver<DeviceCommand>, s
                         }
                         device.set_snapshot(snapshot);
 
-                        if device.touch_enabled.load(Ordering::SeqCst) {
-                            if let Some(callback) = *shared.callback.lock().unwrap() {
-                                unsafe {
-                                    callback(device.player, snapshot.touch.as_ptr());
-                                }
+                        if device.touch_enabled.load(Ordering::SeqCst)
+                            && let Some(callback) = *shared.callback.lock().unwrap()
+                        {
+                            unsafe {
+                                callback(device.player, snapshot.touch.as_ptr());
                             }
                         }
                     }
                     ParsedFrame::BoardInfo(version) => {
                         board_info_pending = false;
                         board_info_logged = true;
-                        log_line(&format!("[Affine IO] P{} Firmware: {version}", device.player));
+                        log_line(&format!(
+                            "[Affine IO] P{} Firmware: {version}",
+                            device.player
+                        ));
                     }
                 }
             }
@@ -517,18 +535,20 @@ fn led_thread(devices: [Arc<DeviceHandle>; 2], shared: Arc<SharedState>) {
 
             for index in 0..8 {
                 let fade = &mut led_state.fades[board][index];
-                let next = if fade.duration == 0 || now >= fade.start_time.saturating_add(fade.duration) {
-                    fade.target
-                } else {
-                    let progress = (now - fade.start_time) as f32 / fade.duration as f32;
-                    LedColor {
-                        r: interpolate(fade.start.r, fade.target.r, progress),
-                        g: interpolate(fade.start.g, fade.target.g, progress),
-                        b: interpolate(fade.start.b, fade.target.b, progress),
-                    }
-                };
+                let next =
+                    if fade.duration == 0 || now >= fade.start_time.saturating_add(fade.duration) {
+                        fade.target
+                    } else {
+                        let progress = (now - fade.start_time) as f32 / fade.duration as f32;
+                        LedColor {
+                            r: interpolate(fade.start.r, fade.target.r, progress),
+                            g: interpolate(fade.start.g, fade.target.g, progress),
+                            b: interpolate(fade.start.b, fade.target.b, progress),
+                        }
+                    };
 
-                if next.r != fade.current.r || next.g != fade.current.g || next.b != fade.current.b {
+                if next.r != fade.current.r || next.g != fade.current.g || next.b != fade.current.b
+                {
                     need_update = true;
                 }
 

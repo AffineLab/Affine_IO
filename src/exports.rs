@@ -1,3 +1,5 @@
+#![allow(clippy::missing_safety_doc)]
+
 use crate::aime;
 use crate::mai2;
 use crate::slider;
@@ -312,7 +314,9 @@ pub unsafe extern "C" fn aime_io_nfc_felica_transact(
         return S_FALSE;
     }
 
-    aime::felica_transact(unit_no, req_buffer, res_buffer, unsafe { &mut *res_size_written })
+    aime::felica_transact(unit_no, req_buffer, res_buffer, unsafe {
+        &mut *res_size_written
+    })
 }
 
 #[unsafe(no_mangle)]

@@ -1,7 +1,8 @@
 # Affine IO
 
-Affine IO is now built as a single Rust `cdylib` that exports the current
-`segatools` ABI for `aimeio`, `mai2io`, `chuniio`, and `mercuryio`.
+Affine IO is now a Rust-only repository. It builds a single Rust `cdylib` that
+exports the current `segatools` ABI for `aimeio`, `mai2io`, `chuniio`, and
+`mercuryio`.
 
 ## Build
 
@@ -23,6 +24,14 @@ same built binary under the expected file names such as `aimeio.dll`,
 The runtime keeps compatibility with `SEGATOOLS_CONFIG_PATH` and
 `.\\segatools.ini`. The current hardware target is the Affine serial stack plus
 the Monica Sega-serial NFC reader.
+
+## CI
+
+GitHub Actions now includes:
+
+- `CI`: `fmt`, `clippy`, and `cargo test`
+- `Build`: release DLL builds for both `x64` and `x86`, with packaged alias
+  names for `aimeio.dll`, `mai2io.dll`, `chuniio.dll`, and `mercuryio.dll`
 
 ## Commercial use
 
