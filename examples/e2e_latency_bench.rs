@@ -255,7 +255,7 @@ mod bench {
         sample_stats_us(&format!("{label}-host-minus-device"), transit_samples_us);
         sample_stats_us(
             &format!("{label}-host-to-device-est"),
-            host_to_device_samples_us,
+            host_to_device_samples_us.clone(),
         );
         sample_stats_us(
             &format!("{label}-device-to-host-est"),
@@ -276,7 +276,7 @@ mod bench {
                     &mut port,
                     iterations,
                     frequency,
-                    &clock_offset_samples_us,
+                    &host_to_device_samples_us,
                 );
             }
         }
@@ -346,9 +346,9 @@ mod bench {
         port: &mut SerialPort,
         iterations: usize,
         frequency: f64,
-        clock_offset_samples_us: &[f64],
+        host_to_device_samples_us: &[f64],
     ) {
-        let Some(clock_offset_us) = robust_median(clock_offset_samples_us) else {
+        let Some(host_to_device_us) = robust_median(host_to_device_samples_us) else {
             return;
         };
 
@@ -372,6 +372,7 @@ mod bench {
 
         for sequence in 0..iterations {
             let payload = make_event_arm_payload(sequence as u32, EVENT_DELAY_MS);
+            let send_us = ticks_to_us(perf_counter(), frequency);
             if !send_mai2_frame(port, BENCHMARK_HID_EVENT_CMD, &payload) {
                 println!("{label}: hid event write failed on iteration {sequence}");
                 break;
@@ -388,9 +389,12 @@ mod bench {
             };
 
             let recv_us = ticks_to_us(perf_counter(), frequency);
-            let event_host_est_us =
-                clock_offset_us + cycles_to_us(reply.event_cycles, reply.core_hz);
-            let tx_host_est_us = clock_offset_us + cycles_to_us(reply.tx_cycles, reply.core_hz);
+            let event_host_est_us = send_us + host_to_device_us + EVENT_DELAY_MS as f64 * 1000.0;
+            let tx_host_est_us = event_host_est_us
+                + cycles_to_us(
+                    reply.tx_cycles.wrapping_sub(reply.event_cycles),
+                    reply.core_hz,
+                );
 
             event_to_host_samples_us.push((recv_us - event_host_est_us).max(0.0));
             tx_to_host_samples_us.push((recv_us - tx_host_est_us).max(0.0));
@@ -401,7 +405,7 @@ mod bench {
         }
 
         println!(
-            "{label}: hid-event-samples={} event-delay={}ms clock-offset={clock_offset_us:.3}us",
+            "{label}: hid-event-samples={} event-delay={}ms arm-path-est={host_to_device_us:.3}us",
             event_to_host_samples_us.len(),
             EVENT_DELAY_MS
         );
