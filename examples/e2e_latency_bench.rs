@@ -181,10 +181,12 @@ mod bench {
         let mut host_samples_ticks = Vec::with_capacity(iterations);
         let mut device_samples_us = Vec::with_capacity(iterations);
         let mut transit_samples_us = Vec::with_capacity(iterations);
+        let mut host_to_device_samples_us = Vec::with_capacity(iterations);
+        let mut device_to_host_samples_us = Vec::with_capacity(iterations);
 
         for sequence in 0..iterations {
             let payload = make_benchmark_payload(sequence as u64);
-            let start = perf_counter();
+            let send_ticks = perf_counter();
 
             if !send_benchmark_request(&mut port, protocol, &payload) {
                 println!("{label}: write failed on iteration {sequence}");
@@ -201,16 +203,29 @@ mod bench {
                 }
             };
 
-            let host_ticks = perf_counter() - start;
+            let recv_ticks = perf_counter();
+            let host_ticks = recv_ticks - send_ticks;
             let host_us = ticks_to_us(host_ticks, frequency);
             let device_us = cycles_to_us(
                 reply.tx_cycles.wrapping_sub(reply.dispatch_cycles),
                 reply.core_hz,
             );
+            let host_send_us = ticks_to_us(send_ticks, frequency);
+            let host_recv_us = ticks_to_us(recv_ticks, frequency);
+            let device_recv_us = cycles_to_us(reply.dispatch_cycles, reply.core_hz);
+            let device_send_us = cycles_to_us(reply.tx_cycles, reply.core_hz);
+            let device_to_host_offset_us =
+                ((host_send_us + host_recv_us) - (device_recv_us + device_send_us)) / 2.0;
+            let host_to_device_est_us =
+                ((device_to_host_offset_us + device_recv_us) - host_send_us).max(0.0);
+            let device_to_host_est_us =
+                (host_recv_us - (device_to_host_offset_us + device_send_us)).max(0.0);
 
             host_samples_ticks.push(host_ticks);
             device_samples_us.push(device_us);
             transit_samples_us.push((host_us - device_us).max(0.0));
+            host_to_device_samples_us.push(host_to_device_est_us);
+            device_to_host_samples_us.push(device_to_host_est_us);
         }
 
         if host_samples_ticks.is_empty() {
@@ -222,6 +237,14 @@ mod bench {
         sample_stats_ticks(&format!("{label}-rtt"), host_samples_ticks, frequency);
         sample_stats_us(&format!("{label}-device"), device_samples_us);
         sample_stats_us(&format!("{label}-host-minus-device"), transit_samples_us);
+        sample_stats_us(
+            &format!("{label}-host-to-device-est"),
+            host_to_device_samples_us,
+        );
+        sample_stats_us(
+            &format!("{label}-device-to-host-est"),
+            device_to_host_samples_us,
+        );
         port.close();
     }
 

@@ -53,6 +53,8 @@ measures:
 - host-observed round-trip time
 - device-side handling time from `t_rx` to `t_tx`
 - host-minus-device time as a quick transport/stack estimate
+- estimated `host -> device` one-way latency
+- estimated `device -> host` one-way latency
 
 - Run: `cargo run --example e2e_latency_bench --features latency-bench`
 - Iterations: `cargo run --example e2e_latency_bench --features latency-bench -- --iterations=1000`
@@ -63,6 +65,10 @@ The hardware mode currently expects the benchmark firmware command `0x22` on the
 `Mai_stm32` and `Chunithm_Stm32` boards. `--synthetic` skips hardware probing
 and only runs the old in-process callback/poll measurements for `mai2`,
 `chuni`, and `mercury`.
+
+The one-way figures are estimates derived from host send/receive timestamps plus
+firmware `t_rx`/`t_tx` timestamps. They are useful for directionality, but they
+are not a strict clock-synchronized ground truth.
 
 ## Commercial use
 
