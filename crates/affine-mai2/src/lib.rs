@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use affine_core::serial::{SerialPort, find_com_port};
 use affine_core::shared_memory::SharedPage;
@@ -25,6 +25,9 @@ const AFFINE_HEARTBEAT_INTERVAL_MS: u64 = 100;
 const AFFINE_RESCAN_INTERVAL_MS: u64 = 500;
 const AFFINE_BOARD_INFO_DELAY_MS: u64 = 500;
 const AFFINE_BOARD_INFO_TIMEOUT_MS: u64 = 1_000;
+const AFFINE_DEVICE_LOOP_SLEEP_MS: u64 = 1;
+const AFFINE_SERIAL_READ_BUF_LEN: usize = 256;
+const AFFINE_SERIAL_RX_BUF_LEN: usize = 512;
 
 const MAI2_IO_OPBTN_TEST: u8 = 0x01;
 const MAI2_IO_OPBTN_SERVICE: u8 = 0x02;
@@ -180,6 +183,51 @@ impl DeviceHandle {
     }
 }
 
+struct SerialSession {
+    port: SerialPort,
+    active: AtomicBool,
+    reader_failed: AtomicBool,
+    board_info_pending: AtomicBool,
+    board_info_logged: AtomicBool,
+}
+
+impl SerialSession {
+    fn new(port: SerialPort) -> Arc<Self> {
+        Arc::new(Self {
+            port,
+            active: AtomicBool::new(true),
+            reader_failed: AtomicBool::new(false),
+            board_info_pending: AtomicBool::new(true),
+            board_info_logged: AtomicBool::new(false),
+        })
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst) && !self.reader_failed.load(Ordering::SeqCst)
+    }
+
+    fn read(&self, buf: &mut [u8]) -> Option<usize> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Some(0);
+        }
+
+        self.port.read(buf)
+    }
+
+    fn write_frame(&self, cmd: u8, payload: &[u8]) -> bool {
+        if !self.active.load(Ordering::SeqCst) {
+            return false;
+        }
+
+        send_frame(&self.port, cmd, payload)
+    }
+
+    fn close(&self) {
+        self.active.store(false, Ordering::SeqCst);
+        self.port.close();
+    }
+}
+
 pub struct Mai2Runtime {
     shared: Arc<SharedState>,
     devices: [Arc<DeviceHandle>; 2],
@@ -254,8 +302,11 @@ impl Mai2Runtime {
             let shared = self.shared.clone();
             let serial_device = device.clone();
             let serial_shared = shared.clone();
+            let touch_device = device.clone();
+            let touch_shared = shared.clone();
             thread::spawn(move || device_thread(serial_device, serial_shared));
             thread::spawn(move || hid_thread(device, shared));
+            thread::spawn(move || touch_callback_thread(touch_device, touch_shared));
         }
 
         log_line("[Affine IO] Initialization complete.");
@@ -446,12 +497,9 @@ impl Mai2Runtime {
 }
 
 fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
-    let mut port = SerialPort::default();
-    let mut rx_buf = [0u8; 128];
-    let mut rx_len = 0usize;
+    let mut session: Option<Arc<SerialSession>> = None;
+    let mut reader_handle: Option<JoinHandle<()>> = None;
     let mut last_heartbeat = tick_ms();
-    let mut board_info_pending = false;
-    let mut board_info_logged = false;
     let mut board_info_start_ms = 0u64;
     let mut board_info_request_ms = 0u64;
     let mut last_buttons_sequence = 0u64;
@@ -462,17 +510,14 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
 
     loop {
         if !device.enabled.load(Ordering::SeqCst) {
-            if port.is_open() {
-                port.close();
-                device.input_page.write(Mai2InputPage::default());
-            }
+            disconnect_session(&mut session, &mut reader_handle, &device);
             device_missing_logged = false;
             port_open_failed_logged = false;
             sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
             continue;
         }
 
-        if !port.is_open() {
+        if session.is_none() {
             let Some(port_path) = find_com_port(AFFINE_VID, device.pid) else {
                 if !device_missing_logged {
                     log_line(&format!(
@@ -486,6 +531,7 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
                 continue;
             };
 
+            let mut port = SerialPort::default();
             if !port.open(&port_path, 115_200) {
                 if !port_open_failed_logged {
                     log_line(&format!(
@@ -504,29 +550,56 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
                 device.player,
                 port_path.trim_start_matches("\\\\.\\")
             ));
+            let _ = port.set_timeouts(1, 1, 0, 50, 5);
+
+            let opened_session = SerialSession::new(port);
+            let reader_device = device.clone();
+            let reader_shared = shared.clone();
+            let reader_session = opened_session.clone();
+            reader_handle = Some(thread::spawn(move || {
+                serial_reader_thread(reader_device, reader_shared, reader_session);
+            }));
+            session = Some(opened_session);
+
             device_missing_logged = false;
             port_open_failed_logged = false;
             device.input_page.update(|page| {
                 page.connected = 1;
                 page.sequence = page.sequence.wrapping_add(1);
             });
-            rx_len = 0;
             last_heartbeat = tick_ms();
-            board_info_pending = true;
-            board_info_logged = false;
             board_info_start_ms = tick_ms();
             board_info_request_ms = 0;
         }
 
+        let Some(active_session) = session.as_ref().cloned() else {
+            sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
+            continue;
+        };
+
+        if !active_session.is_active() {
+            disconnect_session(&mut session, &mut reader_handle, &device);
+            sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
+            continue;
+        }
+
         let now = tick_ms();
 
-        if board_info_pending {
+        if now.saturating_sub(last_heartbeat) >= AFFINE_HEARTBEAT_INTERVAL_MS {
+            if !active_session.write_frame(AFFINE_CMD_HEARTBEAT, &[]) {
+                disconnect_session(&mut session, &mut reader_handle, &device);
+                sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
+                continue;
+            }
+            last_heartbeat = now;
+        }
+
+        if active_session.board_info_pending.load(Ordering::SeqCst) {
             if board_info_request_ms == 0
                 && now.saturating_sub(board_info_start_ms) >= AFFINE_BOARD_INFO_DELAY_MS
             {
-                if !send_frame(&mut port, AFFINE_CMD_GET_BOARD_INFO, &[]) {
-                    port.close();
-                    device.input_page.write(Mai2InputPage::default());
+                if !active_session.write_frame(AFFINE_CMD_GET_BOARD_INFO, &[]) {
+                    disconnect_session(&mut session, &mut reader_handle, &device);
                     sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
                     continue;
                 }
@@ -534,35 +607,27 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
             } else if board_info_request_ms != 0
                 && now.saturating_sub(board_info_request_ms) >= AFFINE_BOARD_INFO_TIMEOUT_MS
             {
-                if !send_frame(&mut port, AFFINE_CMD_GET_BOARD_INFO, &[]) {
-                    port.close();
-                    device.input_page.write(Mai2InputPage::default());
+                if !active_session.write_frame(AFFINE_CMD_GET_BOARD_INFO, &[]) {
+                    disconnect_session(&mut session, &mut reader_handle, &device);
                     sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
                     continue;
                 }
                 board_info_request_ms = now;
-                if now.saturating_sub(board_info_start_ms) > 3_000 && !board_info_logged {
-                    board_info_pending = false;
-                    board_info_logged = true;
+                if now.saturating_sub(board_info_start_ms) > 3_000
+                    && !active_session.board_info_logged.load(Ordering::SeqCst)
+                {
+                    active_session.board_info_pending.store(false, Ordering::SeqCst);
+                    active_session.board_info_logged.store(true, Ordering::SeqCst);
                     log_line(&format!("[Affine IO] P{} Firmware: unknown", device.player));
                 }
             }
-        } else if now.saturating_sub(last_heartbeat) >= AFFINE_HEARTBEAT_INTERVAL_MS {
-            if !send_frame(&mut port, AFFINE_CMD_HEARTBEAT, &[]) {
-                port.close();
-                device.input_page.write(Mai2InputPage::default());
-                sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
-                continue;
-            }
-            last_heartbeat = now;
         }
 
         let output = device.output_page.read();
 
         if output.buttons_sequence != last_buttons_sequence {
-            if !send_frame(&mut port, 0x14, &output.buttons) {
-                port.close();
-                device.input_page.write(Mai2InputPage::default());
+            if !active_session.write_frame(0x14, &output.buttons) {
+                disconnect_session(&mut session, &mut reader_handle, &device);
                 sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
                 continue;
             }
@@ -570,9 +635,8 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
         }
 
         if output.billboard_sequence != last_billboard_sequence {
-            if !send_frame(&mut port, 0x15, &output.billboard) {
-                port.close();
-                device.input_page.write(Mai2InputPage::default());
+            if !active_session.write_frame(0x15, &output.billboard) {
+                disconnect_session(&mut session, &mut reader_handle, &device);
                 sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
                 continue;
             }
@@ -580,21 +644,32 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
         }
 
         if output.pwm_sequence != last_pwm_sequence {
-            if !send_frame(&mut port, 0x16, &output.pwm) {
-                port.close();
-                device.input_page.write(Mai2InputPage::default());
+            if !active_session.write_frame(0x16, &output.pwm) {
+                disconnect_session(&mut session, &mut reader_handle, &device);
                 sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
                 continue;
             }
             last_pwm_sequence = output.pwm_sequence;
         }
 
-        let mut read_buf = [0u8; 64];
-        let Some(read) = port.read(&mut read_buf) else {
-            port.close();
-            device.input_page.write(Mai2InputPage::default());
-            sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
-            continue;
+        sleep_ms(AFFINE_DEVICE_LOOP_SLEEP_MS);
+    }
+}
+
+fn serial_reader_thread(
+    device: Arc<DeviceHandle>,
+    shared: Arc<SharedState>,
+    session: Arc<SerialSession>,
+) {
+    let mut rx_buf = [0u8; AFFINE_SERIAL_RX_BUF_LEN];
+    let mut rx_len = 0usize;
+    let mut read_buf = [0u8; AFFINE_SERIAL_READ_BUF_LEN];
+
+    while session.active.load(Ordering::SeqCst) {
+        let Some(read) = session.read(&mut read_buf) else {
+            session.reader_failed.store(true, Ordering::SeqCst);
+            session.active.store(false, Ordering::SeqCst);
+            break;
         };
 
         if read == 0 {
@@ -625,8 +700,8 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
                         );
                     }
                     ParsedFrame::BoardInfo(version) => {
-                        board_info_pending = false;
-                        board_info_logged = true;
+                        session.board_info_pending.store(false, Ordering::SeqCst);
+                        session.board_info_logged.store(true, Ordering::SeqCst);
                         log_line(&format!(
                             "[Affine IO] P{} Firmware: {version}",
                             device.player
@@ -636,6 +711,22 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
             }
         }
     }
+}
+
+fn disconnect_session(
+    session: &mut Option<Arc<SerialSession>>,
+    reader_handle: &mut Option<JoinHandle<()>>,
+    device: &DeviceHandle,
+) {
+    if let Some(active_session) = session.take() {
+        active_session.close();
+    }
+
+    if let Some(handle) = reader_handle.take() {
+        let _ = handle.join();
+    }
+
+    device.input_page.write(Mai2InputPage::default());
 }
 
 fn hid_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
@@ -722,6 +813,21 @@ fn hid_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
     }
 }
 
+fn touch_callback_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
+    loop {
+        if device.enabled.load(Ordering::SeqCst) && device.output_page.read().touch_enabled != 0 {
+            let touch = device.input_page.read().touch;
+            if let Some(callback) = *shared.callback.lock().unwrap() {
+                unsafe {
+                    callback(device.player, touch.as_ptr());
+                }
+            }
+        }
+
+        sleep_ms(1);
+    }
+}
+
 fn led_thread(devices: [Arc<DeviceHandle>; 2], shared: Arc<SharedState>) {
     loop {
         sleep_ms(8);
@@ -777,7 +883,7 @@ enum ParsedFrame {
     BoardInfo(String),
 }
 
-fn try_parse_frame(rx_buf: &mut [u8; 128], rx_len: &mut usize) -> Option<ParsedFrame> {
+fn try_parse_frame(rx_buf: &mut [u8], rx_len: &mut usize) -> Option<ParsedFrame> {
     loop {
         if *rx_len == 0 {
             return None;
@@ -792,7 +898,10 @@ fn try_parse_frame(rx_buf: &mut [u8; 128], rx_len: &mut usize) -> Option<ParsedF
                 if *rx_len < 14 {
                     return None;
                 }
-                if rx_buf[13] == 0x0A {
+                let checksum = rx_buf[..13]
+                    .iter()
+                    .fold(0u8, |sum, &byte| sum.wrapping_add(byte));
+                if rx_buf[13] == checksum {
                     let buttons0 = (rx_buf[3] & 0x0F) | (rx_buf[4] & 0xF0);
                     let io_status = rx_buf[5] & 0x3F;
                     let mut touch = [0u8; 7];
@@ -846,7 +955,7 @@ fn try_parse_frame(rx_buf: &mut [u8; 128], rx_len: &mut usize) -> Option<ParsedF
     }
 }
 
-fn consume(rx_buf: &mut [u8; 128], rx_len: &mut usize, count: usize) {
+fn consume(rx_buf: &mut [u8], rx_len: &mut usize, count: usize) {
     if count >= *rx_len {
         *rx_len = 0;
         return;
@@ -869,7 +978,7 @@ fn parse_board_info(data: &[u8]) -> String {
     String::from_utf8_lossy(&data[1..1 + length]).into_owned()
 }
 
-fn send_frame(port: &mut SerialPort, cmd: u8, payload: &[u8]) -> bool {
+fn send_frame(port: &SerialPort, cmd: u8, payload: &[u8]) -> bool {
     let mut frame = Vec::with_capacity(payload.len() + 4);
     frame.push(0xFF);
     frame.push(cmd);
@@ -887,13 +996,12 @@ fn interpolate(start: u8, end: u8, progress: f32) -> u8 {
 
 fn apply_device_frame(
     device: &DeviceHandle,
-    shared: &SharedState,
+    _shared: &SharedState,
     buttons0: Option<u8>,
     io_status: Option<u8>,
     touch: Option<[u8; 7]>,
 ) {
-    let touch_changed = touch.is_some();
-    let (touch_copy, touch_enabled) = device.input_page.update(|page| {
+    device.input_page.update(|page| {
         page.connected = 1;
         if let Some(buttons0) = buttons0 {
             page.buttons0 = buttons0;
@@ -905,18 +1013,7 @@ fn apply_device_frame(
             page.touch = touch;
         }
         page.sequence = page.sequence.wrapping_add(1);
-
-        (page.touch, device.output_page.read().touch_enabled != 0)
     });
-
-    if touch_changed
-        && touch_enabled
-        && let Some(callback) = *shared.callback.lock().unwrap()
-    {
-        unsafe {
-            callback(device.player, touch_copy.as_ptr());
-        }
-    }
 }
 
 fn map_buttons(buttons0: u8, buttons1: u8) -> u16 {

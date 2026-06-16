@@ -1,8 +1,10 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, c_void};
 use std::iter::once;
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::ptr::{null, null_mut};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use windows_sys::Win32::Devices::Communication::{
     COMMTIMEOUTS, DCB, GetCommState, NOPARITY, ONESTOPBIT, SetCommState, SetCommTimeouts,
@@ -14,12 +16,15 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiGetDeviceInterfaceDetailW, SetupDiGetDeviceRegistryPropertyW,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_DEVICE_NOT_CONNECTED, ERROR_INVALID_HANDLE, ERROR_NO_MORE_ITEMS,
-    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_DEVICE_NOT_CONNECTED, ERROR_INVALID_HANDLE, ERROR_IO_PENDING,
+    ERROR_NO_MORE_ITEMS, ERROR_OPERATION_ABORTED, GENERIC_READ, GENERIC_WRITE, GetLastError,
+    HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, ReadFile, WriteFile,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, ReadFile, WriteFile,
 };
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent};
 
 const GUID_DEVINTERFACE_COMPORT: windows_sys::core::GUID = windows_sys::core::GUID {
     data1: 0x86e0d1e0,
@@ -29,25 +34,47 @@ const GUID_DEVINTERFACE_COMPORT: windows_sys::core::GUID = windows_sys::core::GU
 };
 
 pub struct SerialPort {
-    handle: HANDLE,
+    handle: AtomicPtr<c_void>,
+    read_state: Mutex<OverlappedState>,
+    write_state: Mutex<OverlappedState>,
 }
 
 unsafe impl Send for SerialPort {}
+unsafe impl Sync for SerialPort {}
+
+struct OverlappedState {
+    event: HANDLE,
+    overlapped: OVERLAPPED,
+}
+
+impl Default for OverlappedState {
+    fn default() -> Self {
+        Self {
+            event: null_mut(),
+            overlapped: unsafe { zeroed() },
+        }
+    }
+}
 
 impl Default for SerialPort {
     fn default() -> Self {
         Self {
-            handle: INVALID_HANDLE_VALUE,
+            handle: AtomicPtr::new(INVALID_HANDLE_VALUE),
+            read_state: Mutex::new(OverlappedState::default()),
+            write_state: Mutex::new(OverlappedState::default()),
         }
     }
 }
 
 impl SerialPort {
     pub fn is_open(&self) -> bool {
-        !self.handle.is_null() && self.handle != INVALID_HANDLE_VALUE
+        let handle = self.handle.load(Ordering::SeqCst) as HANDLE;
+        !handle.is_null() && handle != INVALID_HANDLE_VALUE
     }
 
     pub fn open(&mut self, path: &str, baud: u32) -> bool {
+        self.close();
+
         let wide = to_wide(path);
         let handle = unsafe {
             CreateFileW(
@@ -56,12 +83,19 @@ impl SerialPort {
                 0,
                 null(),
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
                 null_mut(),
             )
         };
 
         if handle == INVALID_HANDLE_VALUE {
+            return false;
+        }
+
+        if !self.ensure_events() {
+            unsafe {
+                CloseHandle(handle);
+            }
             return false;
         }
 
@@ -102,12 +136,12 @@ impl SerialPort {
             return false;
         }
 
-        self.handle = handle;
+        self.handle.store(handle, Ordering::SeqCst);
         true
     }
 
     pub fn set_timeouts(
-        &mut self,
+        &self,
         read_interval_timeout: u32,
         read_total_timeout_constant: u32,
         read_total_timeout_multiplier: u32,
@@ -118,8 +152,10 @@ impl SerialPort {
             return false;
         }
 
+        let handle = self.handle.load(Ordering::SeqCst) as HANDLE;
+
         Self::apply_timeouts(
-            self.handle,
+            handle,
             COMMTIMEOUTS {
                 ReadIntervalTimeout: read_interval_timeout,
                 ReadTotalTimeoutConstant: read_total_timeout_constant,
@@ -130,34 +166,54 @@ impl SerialPort {
         )
     }
 
-    pub fn close(&mut self) {
-        if self.is_open() {
+    pub fn close(&self) {
+        let handle = self.handle.swap(INVALID_HANDLE_VALUE, Ordering::SeqCst) as HANDLE;
+        if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
             unsafe {
-                CloseHandle(self.handle);
+                CancelIoEx(handle, null());
+                CloseHandle(handle);
             }
         }
-        self.handle = INVALID_HANDLE_VALUE;
     }
 
-    pub fn read(&mut self, buf: &mut [u8]) -> Option<usize> {
-        if !self.is_open() {
+    pub fn read(&self, buf: &mut [u8]) -> Option<usize> {
+        let handle = self.handle.load(Ordering::SeqCst) as HANDLE;
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+
+        let mut state = self.read_state.lock().unwrap();
+        if !prepare_overlapped(&mut state) {
             return None;
         }
 
         let mut read = 0u32;
         let ok = unsafe {
             ReadFile(
-                self.handle,
+                handle,
                 buf.as_mut_ptr().cast(),
                 buf.len() as u32,
                 &mut read,
-                null_mut(),
+                &mut state.overlapped,
             )
         };
 
         if ok == 0 {
-            let err = unsafe { GetLastError() };
-            if err == ERROR_INVALID_HANDLE || err == ERROR_DEVICE_NOT_CONNECTED {
+            let mut err = unsafe { GetLastError() };
+            if err == ERROR_IO_PENDING {
+                if unsafe {
+                    GetOverlappedResult(handle, &mut state.overlapped, &mut read, 1)
+                } != 0
+                {
+                    return Some(read as usize);
+                }
+                err = unsafe { GetLastError() };
+            }
+
+            if err == ERROR_INVALID_HANDLE
+                || err == ERROR_DEVICE_NOT_CONNECTED
+                || err == ERROR_OPERATION_ABORTED
+            {
                 return None;
             }
             return Some(0);
@@ -166,21 +222,48 @@ impl SerialPort {
         Some(read as usize)
     }
 
-    pub fn write(&mut self, buf: &[u8]) -> bool {
-        if !self.is_open() {
+    pub fn write(&self, buf: &[u8]) -> bool {
+        let handle = self.handle.load(Ordering::SeqCst) as HANDLE;
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return false;
+        }
+
+        let mut state = self.write_state.lock().unwrap();
+        if !prepare_overlapped(&mut state) {
             return false;
         }
 
         let mut written = 0u32;
         let ok = unsafe {
             WriteFile(
-                self.handle,
+                handle,
                 buf.as_ptr().cast(),
                 buf.len() as u32,
                 &mut written,
-                null_mut(),
+                &mut state.overlapped,
             )
         };
+
+        if ok == 0 {
+            let mut err = unsafe { GetLastError() };
+            if err == ERROR_IO_PENDING {
+                if unsafe {
+                    GetOverlappedResult(handle, &mut state.overlapped, &mut written, 1)
+                } != 0
+                {
+                    return written as usize == buf.len();
+                }
+                err = unsafe { GetLastError() };
+            }
+
+            if err == ERROR_INVALID_HANDLE
+                || err == ERROR_DEVICE_NOT_CONNECTED
+                || err == ERROR_OPERATION_ABORTED
+            {
+                return false;
+            }
+            return false;
+        }
 
         ok != 0 && written as usize == buf.len()
     }
@@ -188,12 +271,67 @@ impl SerialPort {
     fn apply_timeouts(handle: HANDLE, timeouts: COMMTIMEOUTS) -> bool {
         unsafe { SetCommTimeouts(handle, &timeouts) != 0 }
     }
+
+    fn ensure_events(&self) -> bool {
+        let mut read_state = self.read_state.lock().unwrap();
+        if !ensure_event(&mut read_state) {
+            return false;
+        }
+        drop(read_state);
+
+        let mut write_state = self.write_state.lock().unwrap();
+        ensure_event(&mut write_state)
+    }
 }
 
 impl Drop for SerialPort {
     fn drop(&mut self) {
         self.close();
+
+        if let Ok(mut read_state) = self.read_state.lock() {
+            if !read_state.event.is_null() {
+                unsafe {
+                    CloseHandle(read_state.event);
+                }
+                read_state.event = null_mut();
+            }
+        }
+
+        if let Ok(mut write_state) = self.write_state.lock() {
+            if !write_state.event.is_null() {
+                unsafe {
+                    CloseHandle(write_state.event);
+                }
+                write_state.event = null_mut();
+            }
+        }
     }
+}
+
+fn ensure_event(state: &mut OverlappedState) -> bool {
+    if state.event.is_null() {
+        state.event = unsafe { CreateEventW(null_mut(), 1, 0, null()) };
+        if state.event.is_null() {
+            return false;
+        }
+    }
+
+    state.overlapped = unsafe { zeroed() };
+    state.overlapped.hEvent = state.event;
+    true
+}
+
+fn prepare_overlapped(state: &mut OverlappedState) -> bool {
+    if state.event.is_null() && !ensure_event(state) {
+        return false;
+    }
+
+    unsafe {
+        ResetEvent(state.event);
+    }
+    state.overlapped = unsafe { zeroed() };
+    state.overlapped.hEvent = state.event;
+    true
 }
 
 pub fn find_com_port(vid: u16, pid: u16) -> Option<String> {
