@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: x64
+          - target: i686-pc-windows-msvc
+            arch: x86
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # Full history + tags so build.rs `git describe` stamps the tag version
+          # into the DLL instead of a bare commit hash.
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-pc-windows-msvc
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Same key as the Build workflow's matrix so release builds restore those
+          # deps; read-only here so tag builds never evict the shared caches.
+          key: ${{ matrix.target }}
+          save-if: false
+
+      - name: Build release DLL
+        run: cargo build -p affine-io --release --locked --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $source = "target/${{ matrix.target }}/release/affine_io.dll"
+          if (-not (Test-Path -LiteralPath $source)) {
+            throw "Missing build output: $source"
+          }
+          Copy-Item -LiteralPath $source -Destination "dist/affine_io-${{ matrix.arch }}.dll" -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: affine-io-${{ matrix.arch }}
+          path: dist/affine_io-${{ matrix.arch }}.dll
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    # Only publish a Release for tag pushes; workflow_dispatch on a branch just
+    # builds the artifacts above.
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      # Write is needed to create the GitHub Release and upload its assets.
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/*.dll \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes
