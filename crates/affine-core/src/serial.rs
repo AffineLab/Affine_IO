@@ -18,13 +18,15 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_DEVICE_NOT_CONNECTED, ERROR_INVALID_HANDLE, ERROR_IO_PENDING,
     ERROR_NO_MORE_ITEMS, ERROR_OPERATION_ABORTED, GENERIC_READ, GENERIC_WRITE, GetLastError,
-    HANDLE, INVALID_HANDLE_VALUE,
+    HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
-use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent};
+use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
+
+const OVERLAPPED_WRITE_TIMEOUT_MS: u32 = 50;
 
 const GUID_DEVINTERFACE_COMPORT: windows_sys::core::GUID = windows_sys::core::GUID {
     data1: 0x86e0d1e0,
@@ -201,10 +203,7 @@ impl SerialPort {
         if ok == 0 {
             let mut err = unsafe { GetLastError() };
             if err == ERROR_IO_PENDING {
-                if unsafe {
-                    GetOverlappedResult(handle, &mut state.overlapped, &mut read, 1)
-                } != 0
-                {
+                if unsafe { GetOverlappedResult(handle, &state.overlapped, &mut read, 1) } != 0 {
                     return Some(read as usize);
                 }
                 err = unsafe { GetLastError() };
@@ -247,13 +246,16 @@ impl SerialPort {
         if ok == 0 {
             let mut err = unsafe { GetLastError() };
             if err == ERROR_IO_PENDING {
-                if unsafe {
-                    GetOverlappedResult(handle, &mut state.overlapped, &mut written, 1)
-                } != 0
-                {
-                    return written as usize == buf.len();
+                match wait_overlapped(
+                    handle,
+                    &mut state,
+                    &mut written,
+                    OVERLAPPED_WRITE_TIMEOUT_MS,
+                ) {
+                    OverlappedWait::Completed => return written as usize == buf.len(),
+                    OverlappedWait::TimedOut => return false,
+                    OverlappedWait::Failed(error) => err = error,
                 }
-                err = unsafe { GetLastError() };
             }
 
             if err == ERROR_INVALID_HANDLE
@@ -288,23 +290,62 @@ impl Drop for SerialPort {
     fn drop(&mut self) {
         self.close();
 
-        if let Ok(mut read_state) = self.read_state.lock() {
-            if !read_state.event.is_null() {
-                unsafe {
-                    CloseHandle(read_state.event);
-                }
-                read_state.event = null_mut();
+        if let Ok(mut read_state) = self.read_state.lock()
+            && !read_state.event.is_null()
+        {
+            unsafe {
+                CloseHandle(read_state.event);
             }
+            read_state.event = null_mut();
         }
 
-        if let Ok(mut write_state) = self.write_state.lock() {
-            if !write_state.event.is_null() {
-                unsafe {
-                    CloseHandle(write_state.event);
-                }
-                write_state.event = null_mut();
+        if let Ok(mut write_state) = self.write_state.lock()
+            && !write_state.event.is_null()
+        {
+            unsafe {
+                CloseHandle(write_state.event);
             }
+            write_state.event = null_mut();
         }
+    }
+}
+
+enum OverlappedWait {
+    Completed,
+    TimedOut,
+    Failed(u32),
+}
+
+fn wait_overlapped(
+    handle: HANDLE,
+    state: &mut OverlappedState,
+    transferred: &mut u32,
+    timeout_ms: u32,
+) -> OverlappedWait {
+    let wait = unsafe { WaitForSingleObject(state.event, timeout_ms) };
+    if wait != WAIT_OBJECT_0 {
+        // Timed out (or the wait failed). Request cancellation, then BLOCK until the
+        // kernel has actually retired the IRP before returning. CancelIoEx only
+        // *requests* cancellation; until GetOverlappedResult reports the operation is
+        // finished the kernel may still reference this OVERLAPPED and the caller's
+        // source buffer. Returning early would let the caller free that buffer (or let
+        // the next call zero this OVERLAPPED) while the I/O is still live — a
+        // use-after-free / completion-record corruption. The abort surfaces here as
+        // ERROR_OPERATION_ABORTED, which we intentionally ignore.
+        unsafe {
+            CancelIoEx(handle, &state.overlapped);
+        }
+        let mut drained = 0u32;
+        unsafe {
+            GetOverlappedResult(handle, &state.overlapped, &mut drained, 1);
+        }
+        return OverlappedWait::TimedOut;
+    }
+
+    if unsafe { GetOverlappedResult(handle, &state.overlapped, transferred, 0) } != 0 {
+        OverlappedWait::Completed
+    } else {
+        OverlappedWait::Failed(unsafe { GetLastError() })
     }
 }
 
