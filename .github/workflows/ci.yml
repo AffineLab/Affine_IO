@@ -4,8 +4,16 @@ on:
   push:
     branches:
       - main
-      - master
+      - dev
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   windows:
@@ -18,17 +26,22 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: i686-pc-windows-msvc
           components: rustfmt, clippy
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          # Only the long-lived branches write the cache; PRs restore read-only so a
+          # large target dir never evicts good caches under the 10 GB cap.
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' }}
 
       - name: Format check
         run: cargo fmt --check
 
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      # Release profile so the gate sees exactly what ships - catches lints that only
+      # fire with debug_assertions off (e.g. unused vars behind cfg logs).
+      - name: Clippy (release)
+        run: cargo clippy --release --workspace --all-targets -- -D warnings
 
       - name: Tests
         run: cargo test --workspace

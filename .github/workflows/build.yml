@@ -4,11 +4,14 @@ on:
   push:
     branches:
       - main
-      - master
+      - dev
     tags:
       - 'v*'
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   windows-release:
@@ -35,6 +38,11 @@ jobs:
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          # Disambiguate the two matrix targets so x64 and x86 don't share (and
+          # clobber) one cache key. PRs restore read-only to protect good caches.
+          key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || startsWith(github.ref, 'refs/tags/') }}
 
       - name: Build release DLL
         run: cargo build -p affine-io --release --locked --target ${{ matrix.target }}
