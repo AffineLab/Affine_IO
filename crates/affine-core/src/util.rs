@@ -4,6 +4,11 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::System::Console::{
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE,
+    SetConsoleMode,
+};
 use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringA;
 
 pub fn tick_ms() -> u64 {
@@ -15,19 +20,101 @@ pub fn sleep_ms(ms: u64) {
     std::thread::sleep(Duration::from_millis(ms));
 }
 
-pub fn log_line(line: &str) {
-    let mut owned = String::from(line);
-    if !owned.ends_with('\n') {
-        owned.push('\n');
-    }
+/// Trailing status tag rendered (and colorized on the console) at the end of a line.
+#[derive(Clone, Copy)]
+enum LogTag {
+    /// Neutral informational line, no tag.
+    None,
+    /// Success / connection established: green `[OK]`.
+    Ok,
+    /// Recoverable problem (will retry): yellow `[WARN]`.
+    Warn,
+    /// Failure: red `[FAIL]`.
+    Fail,
+    /// High-volume diagnostics: whole line dimmed, no tag.
+    Diag,
+}
 
-    if let Ok(cstr) = CString::new(owned.clone()) {
+/// Enable ANSI colors only when stderr is a real console (not redirected to a
+/// file/pipe) and virtual-terminal processing can be turned on. Detected once.
+fn ansi_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| unsafe {
+        let handle = GetStdHandle(STD_ERROR_HANDLE);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut mode = 0u32;
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            return false;
+        }
+        SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+    })
+}
+
+fn emit(tag: LogTag, msg: &str) {
+    let body = format!("[Affine IO] {msg}");
+
+    // Plain text (no escape codes) for OutputDebugStringA / non-console stderr.
+    let plain = match tag {
+        LogTag::Ok => format!("{body} [OK]"),
+        LogTag::Warn => format!("{body} [WARN]"),
+        LogTag::Fail => format!("{body} [FAIL]"),
+        LogTag::None | LogTag::Diag => body.clone(),
+    };
+
+    if let Ok(cstr) = CString::new(format!("{plain}\n")) {
         unsafe {
             OutputDebugStringA(cstr.as_ptr().cast());
         }
     }
 
-    eprint!("{owned}");
+    if ansi_enabled() {
+        let colored = match tag {
+            LogTag::None => body,
+            LogTag::Ok => format!("{body} \x1b[32;1m[OK]\x1b[0m"),
+            LogTag::Warn => format!("{body} \x1b[33;1m[WARN]\x1b[0m"),
+            LogTag::Fail => format!("{body} \x1b[31;1m[FAIL]\x1b[0m"),
+            LogTag::Diag => format!("\x1b[90m{body}\x1b[0m"),
+        };
+        eprintln!("{colored}");
+    } else {
+        eprintln!("{plain}");
+    }
+}
+
+/// Neutral info line. Tolerates a legacy `"[Affine IO] "` prefix so older call
+/// sites keep rendering correctly under the new formatter.
+pub fn log_line(line: &str) {
+    emit(
+        LogTag::None,
+        line.strip_prefix("[Affine IO] ").unwrap_or(line),
+    );
+}
+
+/// Neutral informational line.
+pub fn log_info(msg: &str) {
+    emit(LogTag::None, msg);
+}
+
+/// Success / connection established (green `[OK]`).
+pub fn log_ok(msg: &str) {
+    emit(LogTag::Ok, msg);
+}
+
+/// Recoverable problem that will be retried (yellow `[WARN]`).
+pub fn log_warn(msg: &str) {
+    emit(LogTag::Warn, msg);
+}
+
+/// Failure (red `[FAIL]`).
+pub fn log_fail(msg: &str) {
+    emit(LogTag::Fail, msg);
+}
+
+/// High-volume diagnostics (dimmed line).
+pub fn log_diag(msg: &str) {
+    emit(LogTag::Diag, msg);
 }
 
 pub fn segatools_config_path() -> PathBuf {

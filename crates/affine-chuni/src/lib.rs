@@ -10,7 +10,7 @@ use affine_core::slider::{
     SLIDER_CMD_SET_LED, SliderParser, find_any, send_slider_frame, should_log_scan,
 };
 use affine_core::types::{ChuniSliderCallback, Hresult, S_OK};
-use affine_core::util::{log_line, sleep_ms};
+use affine_core::util::{log_ok, log_warn, sleep_ms};
 
 const AFFINE_VID: u16 = 0xAFF1;
 const CHUNI_PIDS: [u16; 2] = [0x52A4, 0x52A7];
@@ -158,7 +158,7 @@ fn chuni_thread(runtime: Arc<ChuniRuntime>) {
         if !port.is_open() {
             let Some((_, path)) = find_any(AFFINE_VID, &CHUNI_PIDS) else {
                 if should_log_scan(&mut last_scan_log) {
-                    log_line("[Affine IO] Chunithm slider: device not found");
+                    log_warn("Chunithm slider: device not found");
                 }
                 sleep_ms(500);
                 continue;
@@ -166,16 +166,14 @@ fn chuni_thread(runtime: Arc<ChuniRuntime>) {
 
             if !port.open(&path, 115_200) {
                 if should_log_scan(&mut last_scan_log) {
-                    log_line(&format!(
-                        "[Affine IO] Chunithm slider: failed to open {path}"
-                    ));
+                    log_warn(&format!("Chunithm slider: failed to open {path}"));
                 }
                 sleep_ms(500);
                 continue;
             }
 
-            log_line(&format!(
-                "[Affine IO] Chunithm slider connected: {}",
+            log_ok(&format!(
+                "Chunithm slider connected: {}",
                 path.trim_start_matches("\\\\.\\")
             ));
 
@@ -246,13 +244,11 @@ fn chuni_thread(runtime: Arc<ChuniRuntime>) {
         for &byte in &buf[..read] {
             if let Some(packet) = parser.push(byte) {
                 match packet.cmd {
-                    SLIDER_CMD_AUTO_SCAN => {
-                        if packet.payload.len() >= 32 {
-                            let mut pressure = [0u8; 32];
-                            pressure.copy_from_slice(&packet.payload[..32]);
-                            let beams = packet.payload.get(32).copied();
-                            apply_scan_frame(&runtime, pressure, beams);
-                        }
+                    SLIDER_CMD_AUTO_SCAN if packet.payload.len() >= 32 => {
+                        let mut pressure = [0u8; 32];
+                        pressure.copy_from_slice(&packet.payload[..32]);
+                        let beams = packet.payload.get(32).copied();
+                        apply_scan_frame(&runtime, pressure, beams);
                     }
                     SLIDER_CMD_AUTO_AIR => {
                         if let Some(&beams) = packet.payload.first() {

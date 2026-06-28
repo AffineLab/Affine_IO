@@ -9,7 +9,7 @@ use affine_core::slider::{
     should_log_scan,
 };
 use affine_core::types::{Hresult, MercuryLedData, MercuryTouchCallback, S_OK};
-use affine_core::util::{log_line, sleep_ms};
+use affine_core::util::{log_ok, log_warn, sleep_ms};
 
 const AFFINE_VID: u16 = 0xAFF1;
 const MERCURY_PIDS: [u16; 1] = [0x52A5];
@@ -128,7 +128,7 @@ fn mercury_thread(runtime: Arc<MercuryRuntime>) {
         if !port.is_open() {
             let Some((_, path)) = find_any(AFFINE_VID, &MERCURY_PIDS) else {
                 if should_log_scan(&mut last_scan_log) {
-                    log_line("[Affine IO] Mercury touch: device not found");
+                    log_warn("Mercury touch: device not found");
                 }
                 sleep_ms(500);
                 continue;
@@ -136,14 +136,14 @@ fn mercury_thread(runtime: Arc<MercuryRuntime>) {
 
             if !port.open(&path, 115_200) {
                 if should_log_scan(&mut last_scan_log) {
-                    log_line(&format!("[Affine IO] Mercury touch: failed to open {path}"));
+                    log_warn(&format!("Mercury touch: failed to open {path}"));
                 }
                 sleep_ms(500);
                 continue;
             }
 
-            log_line(&format!(
-                "[Affine IO] Mercury touch connected: {}",
+            log_ok(&format!(
+                "Mercury touch connected: {}",
                 path.trim_start_matches("\\\\.\\")
             ));
             runtime.state_page.update(|page| {

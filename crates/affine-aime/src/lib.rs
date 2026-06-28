@@ -2,7 +2,7 @@ use std::sync::{Mutex, OnceLock};
 
 use affine_core::serial::{SerialPort, find_com_port};
 use affine_core::types::{E_FAIL, E_INVALIDARG, Hresult, S_FALSE, S_OK};
-use affine_core::util::log_line;
+use affine_core::util::{log_info, log_ok};
 
 const AFFINE_VID: u16 = 0xAFF1;
 const MONICA_PID: u16 = 0x5730;
@@ -79,8 +79,8 @@ impl Reader {
             return false;
         }
 
-        log_line(&format!(
-            "[Affine IO] Monica reader connected: {}",
+        log_ok(&format!(
+            "Monica reader connected: {}",
             path.trim_start_matches("\\\\.\\")
         ));
         true
@@ -98,13 +98,13 @@ impl Reader {
         if let Ok(res) = self.transact(SG_CMD_GET_FW_VERSION, &[])
             && let Ok(version) = String::from_utf8(res.payload)
         {
-            log_line(&format!("[Affine IO] Monica firmware: {version}"));
+            log_info(&format!("Monica firmware: {version}"));
         }
 
         if let Ok(res) = self.transact(SG_CMD_GET_HW_VERSION, &[])
             && let Ok(version) = String::from_utf8(res.payload)
         {
-            log_line(&format!("[Affine IO] Monica hardware: {version}"));
+            log_info(&format!("Monica hardware: {version}"));
         }
 
         let _ = self.transact(SG_CMD_EXT_BOARD_INFO, &[]);
