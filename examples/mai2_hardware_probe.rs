@@ -1,9 +1,9 @@
 use std::ffi::CString;
 use std::time::{Duration, Instant};
 
+use affine_core::AFFINE_VID;
 use hidapi::{HidApi, HidDevice};
 
-const AFFINE_VID: u16 = 0xAFF1;
 const MAI2_PIDS: [u16; 2] = [0x52A5, 0x52A6];
 
 const USAGE_PAGE_BUTTONS: u16 = 0xFFCA;

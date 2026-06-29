@@ -3,8 +3,8 @@ use std::sync::{Mutex, OnceLock};
 use affine_core::serial::{SerialPort, find_com_port};
 use affine_core::types::{E_FAIL, E_INVALIDARG, Hresult, S_FALSE, S_OK};
 use affine_core::util::{log_info, log_ok};
+use affine_core::{AFFINE_VID, SERIAL_BAUD};
 
-const AFFINE_VID: u16 = 0xAFF1;
 const MONICA_PID: u16 = 0x5730;
 const SG_CMD_GET_FW_VERSION: u8 = 0x30;
 const SG_CMD_GET_HW_VERSION: u8 = 0x32;
@@ -32,7 +32,6 @@ enum CachedCard {
     },
     Felica {
         idm: [u8; 8],
-        _pmm: [u8; 8],
     },
 }
 
@@ -75,7 +74,7 @@ impl Reader {
             return false;
         };
 
-        if !self.port.open(&path, 115_200) {
+        if !self.port.open(&path, SERIAL_BAUD) {
             return false;
         }
 
@@ -185,10 +184,8 @@ impl Reader {
                     return E_FAIL;
                 }
                 let mut idm = [0u8; 8];
-                let mut pmm = [0u8; 8];
                 idm.copy_from_slice(&response.payload[3..11]);
-                pmm.copy_from_slice(&response.payload[11..19]);
-                self.card = CachedCard::Felica { idm, _pmm: pmm };
+                self.card = CachedCard::Felica { idm };
                 S_OK
             }
             _ => {
@@ -227,7 +224,7 @@ impl Reader {
 
     fn get_felica_id(&self, idm_out: &mut u64) -> Hresult {
         match self.card {
-            CachedCard::Felica { idm, .. } => {
+            CachedCard::Felica { idm } => {
                 *idm_out = u64::from_be_bytes(idm);
                 S_OK
             }
@@ -519,5 +516,28 @@ fn read_frame(port: &mut SerialPort) -> Option<Vec<u8>> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_frame_without_escaping() {
+        // seq=1 cmd=2 empty payload -> body [5,0,1,2,0], checksum 8, sync 0xE0.
+        assert_eq!(
+            encode_frame(0x01, 0x02, &[]),
+            vec![0xE0, 0x05, 0x00, 0x01, 0x02, 0x00, 0x08]
+        );
+    }
+
+    #[test]
+    fn encode_frame_escapes_sync_and_escape_bytes() {
+        // seq 0xE0 must be byte-stuffed to 0xD0 0xDF; checksum = 5+0+0xE0+2+0 = 0xE7.
+        assert_eq!(
+            encode_frame(0xE0, 0x02, &[]),
+            vec![0xE0, 0x05, 0x00, 0xD0, 0xDF, 0x02, 0x00, 0xE7]
+        );
     }
 }

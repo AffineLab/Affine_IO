@@ -28,21 +28,41 @@ Output DLLs:
 
 Point the relevant `segatools` DLL path at the single built `affine_io.dll`.
 
-The runtime keeps compatibility with `SEGATOOLS_CONFIG_PATH` and
-`.\\segatools.ini`. The current hardware target is the Affine serial stack plus
-the Monica Sega-serial NFC reader.
+Configuration is read from `SEGATOOLS_CONFIG_PATH` if set, otherwise from
+`.\\segatools.ini`. All Affine controllers share USB Vendor ID `VID_AFF1`.
 
-`mai2`, `chuni`, and `mercury` now use mandatory shared-memory state pages as
-their runtime transport. `mai2` keeps the legacy `mai_io_shm_1` and
-`mai_io_shm_2` mappings for input compatibility.
+### Transports
+
+- `mai2`: USB-HID is the primary transport; the USB-CDC serial path is kept as a
+  fallback. Touch, buttons, and LEDs are carried over whichever link is live.
+- `chuni` / `mercury`: the touch slider runs over USB-CDC serial.
+- `aime`: the Monica NFC reader runs over Sega serial.
+
+Each runtime also publishes its state through named shared-memory pages so other
+tools can mirror it. `mai2` exposes its input pages under the `mai_io_shm_1` and
+`mai_io_shm_2` mappings.
+
+### `segatools.ini` keys
+
+`mai2` reads these (defaults in parentheses):
+
+- `[touch] p1Enable` / `p2Enable` (`1`): enable each player's touch runtime.
+- `[touch] p1DebugInput` / `p2DebugInput` (`0`): enable per-player touch
+  diagnostic logging. (`pxDebugInput` is segatools' own keyboard-touch mapping;
+  Affine only reuses the flag to gate its diagnostics.)
+- `[io4] test` / `service` / `coin`: virtual-key codes for the operator-button
+  keyboard fallback (default `VK_F1` / `VK_F2` / `VK_F3`).
 
 ## CI
 
-GitHub Actions now includes:
+GitHub Actions includes:
 
-- `CI`: `fmt`, workspace `clippy`, and workspace `cargo test`
+- `CI`: `cargo fmt --check`, release-profile workspace `clippy` (warnings denied),
+  and workspace `cargo test`
 - `Build`: release DLL builds for both `x64` and `x86`, packaging only
   `affine_io.dll`
+- `Release`: on a `v*` tag, builds both targets and publishes a GitHub Release
+  with the `x64` and `x86` DLLs attached
 
 ## Latency benchmark
 

@@ -3,9 +3,12 @@
 use affine_core::types::{Hresult, Mai2TouchCallback, S_OK, write_value};
 use affine_mai2 as mai2;
 
+/// segatools mai2io ABI version (high byte = major, low byte = minor).
+const MAI2_IO_API_VERSION: u16 = 0x0102;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn mai2_io_get_api_version() -> u16 {
-    0x0102
+    MAI2_IO_API_VERSION
 }
 
 #[unsafe(no_mangle)]

@@ -11,8 +11,8 @@ use affine_core::slider::{
 };
 use affine_core::types::{ChuniSliderCallback, Hresult, S_OK};
 use affine_core::util::{log_ok, log_warn, sleep_ms};
+use affine_core::{AFFINE_VID, SERIAL_BAUD};
 
-const AFFINE_VID: u16 = 0xAFF1;
 const CHUNI_PIDS: [u16; 2] = [0x52A4, 0x52A7];
 
 const CHUNI_STATE_MAPPING_NAME: &str = "chuni_io_shm";
@@ -164,7 +164,7 @@ fn chuni_thread(runtime: Arc<ChuniRuntime>) {
                 continue;
             };
 
-            if !port.open(&path, 115_200) {
+            if !port.open(&path, SERIAL_BAUD) {
                 if should_log_scan(&mut last_scan_log) {
                     log_warn(&format!("Chunithm slider: failed to open {path}"));
                 }

@@ -3,9 +3,12 @@
 use affine_aime as aime;
 use affine_core::types::{AimeIoVfdState, Hresult, S_FALSE, read_bytes, read_mut_bytes};
 
+/// segatools aimeio ABI version (high byte = major, low byte = minor).
+const AIME_IO_API_VERSION: u16 = 0x0101;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn aime_io_get_api_version() -> u16 {
-    0x0101
+    AIME_IO_API_VERSION
 }
 
 #[unsafe(no_mangle)]

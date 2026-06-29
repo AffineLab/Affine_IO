@@ -10,14 +10,17 @@ use affine_core::util::{
     current_exe_name, ini_get_bool, ini_get_u32, log_diag, log_line, log_ok, log_warn,
     segatools_config_path, sleep_ms, tick_ms,
 };
+use affine_core::{AFFINE_VID, SERIAL_BAUD};
 use hidapi::{HidApi, HidDevice};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F1, VK_F2, VK_F3};
 
-const AFFINE_VID: u16 = 0xAFF1;
 const MAI2_PID_1P: u16 = 0x52A5;
 const MAI2_PID_2P: u16 = 0x52A6;
 const AFFINE_CMD_HEARTBEAT: u8 = 0x11;
 const AFFINE_CMD_GET_BOARD_INFO: u8 = 0xF0;
+const MAI2_CMD_LED_BUTTONS: u8 = 0x14;
+const MAI2_CMD_LED_BILLBOARD: u8 = 0x15;
+const MAI2_CMD_LED_PWM: u8 = 0x16;
 const MAI2_BUTTON_HID_USAGE_PAGE: u16 = 0xFFCA;
 const MAI2_BUTTON_HID_USAGE: u16 = 0x0001;
 const MAI2_BUTTON_HID_REPORT_LEN: usize = 24;
@@ -39,6 +42,7 @@ const AFFINE_HEARTBEAT_INTERVAL_MS: u64 = 100;
 const AFFINE_RESCAN_INTERVAL_MS: u64 = 500;
 const AFFINE_BOARD_INFO_DELAY_MS: u64 = 500;
 const AFFINE_BOARD_INFO_TIMEOUT_MS: u64 = 1_000;
+const AFFINE_BOARD_INFO_GIVEUP_MS: u64 = 3_000;
 const AFFINE_DEVICE_LOOP_SLEEP_MS: u64 = 1;
 const AFFINE_SERIAL_READ_BUF_LEN: usize = 256;
 const AFFINE_SERIAL_RX_BUF_LEN: usize = 512;
@@ -322,7 +326,7 @@ impl Mai2Runtime {
         let p2_diag = ini_get_bool(&config_path, "touch", "p2DebugInput", false);
         let keyboard = KeyboardConfig {
             vk_test: ini_get_u32(&config_path, "io4", "test", VK_F1 as u32) as u16,
-            vk_service: ini_get_u32(&config_path, "io4", "service", VK_F2 as u32) as u16 as u16,
+            vk_service: ini_get_u32(&config_path, "io4", "service", VK_F2 as u32) as u16,
             vk_coin: ini_get_u32(&config_path, "io4", "coin", VK_F3 as u32) as u16,
         };
         log_line(&format!(
@@ -757,7 +761,7 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
             };
 
             let mut port = SerialPort::default();
-            if !port.open(&port_path, 115_200) {
+            if !port.open(&port_path, SERIAL_BAUD) {
                 if !port_open_failed_logged {
                     log_warn(&format!(
                         "P{}: Failed to open port {port_path}",
@@ -845,7 +849,7 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
                     continue;
                 }
                 board_info_request_ms = now;
-                if now.saturating_sub(board_info_start_ms) > 3_000
+                if now.saturating_sub(board_info_start_ms) > AFFINE_BOARD_INFO_GIVEUP_MS
                     && !active_session.board_info_logged.load(Ordering::SeqCst)
                 {
                     active_session
@@ -921,7 +925,7 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
 
         if output.buttons_sequence != last_buttons_sequence {
             let buttons_payload = button_rgb_payload(&output.buttons);
-            if !active_session.write_frame(0x14, &buttons_payload) {
+            if !active_session.write_frame(MAI2_CMD_LED_BUTTONS, &buttons_payload) {
                 device.led_failures.fetch_add(1, Ordering::SeqCst);
                 disconnect_session(&mut session, &mut reader_handle, &device);
                 sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
@@ -933,7 +937,7 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
         }
 
         if output.billboard_sequence != last_billboard_sequence {
-            if !active_session.write_frame(0x15, &output.billboard) {
+            if !active_session.write_frame(MAI2_CMD_LED_BILLBOARD, &output.billboard) {
                 device.led_failures.fetch_add(1, Ordering::SeqCst);
                 disconnect_session(&mut session, &mut reader_handle, &device);
                 sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
@@ -945,7 +949,7 @@ fn device_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
         }
 
         if output.pwm_sequence != last_pwm_sequence {
-            if !active_session.write_frame(0x16, &output.pwm) {
+            if !active_session.write_frame(MAI2_CMD_LED_PWM, &output.pwm) {
                 device.led_failures.fetch_add(1, Ordering::SeqCst);
                 disconnect_session(&mut session, &mut reader_handle, &device);
                 sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
@@ -1200,7 +1204,9 @@ fn vendor_command_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
                         break;
                     }
                     board_info_request_ms = now;
-                    if now.saturating_sub(board_info_start_ms) > 3_000 && !board_info_logged {
+                    if now.saturating_sub(board_info_start_ms) > AFFINE_BOARD_INFO_GIVEUP_MS
+                        && !board_info_logged
+                    {
                         board_info_pending = false;
                         board_info_logged = true;
                         log_warn(&format!("P{} Firmware: unknown", device.player));
@@ -1211,7 +1217,7 @@ fn vendor_command_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
             let output = device.output_page.read();
 
             if output.buttons_sequence != last_buttons_sequence {
-                if !send_hid_frame(&hid, 0x14, &output.buttons) {
+                if !send_hid_frame(&hid, MAI2_CMD_LED_BUTTONS, &output.buttons) {
                     device.led_failures.fetch_add(1, Ordering::SeqCst);
                     break;
                 }
@@ -1221,7 +1227,7 @@ fn vendor_command_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
             }
 
             if output.billboard_sequence != last_billboard_sequence {
-                if !send_hid_frame(&hid, 0x15, &output.billboard) {
+                if !send_hid_frame(&hid, MAI2_CMD_LED_BILLBOARD, &output.billboard) {
                     device.led_failures.fetch_add(1, Ordering::SeqCst);
                     break;
                 }
@@ -1231,7 +1237,7 @@ fn vendor_command_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
             }
 
             if output.pwm_sequence != last_pwm_sequence {
-                if !send_hid_frame(&hid, 0x16, &output.pwm) {
+                if !send_hid_frame(&hid, MAI2_CMD_LED_PWM, &output.pwm) {
                     device.led_failures.fetch_add(1, Ordering::SeqCst);
                     break;
                 }
@@ -1956,4 +1962,107 @@ fn hid_interface_present(pid: u16, usage_page: u16, usage: u16) -> bool {
     };
 
     find_hid_path(&api, AFFINE_VID, pid, usage_page, usage).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fill the trailing checksum byte with the firmware's additive checksum.
+    fn add_checksum(frame: &mut [u8]) {
+        let last = frame.len() - 1;
+        frame[last] = frame[..last]
+            .iter()
+            .fold(0u8, |sum, &b| sum.wrapping_add(b));
+    }
+
+    #[test]
+    fn consume_shifts_then_empties() {
+        let mut buf = [1u8, 2, 3, 4, 5, 0, 0, 0];
+        let mut len = 5usize;
+        consume(&mut buf, &mut len, 2);
+        assert_eq!(len, 3);
+        assert_eq!(&buf[..3], &[3, 4, 5]);
+        consume(&mut buf, &mut len, 9); // count >= len -> drains
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn map_buttons_basic() {
+        assert_eq!(map_buttons(0, 0), 0);
+        assert_eq!(map_buttons(0x01, 0) & MAI2_IO_GAMEBTN_1, MAI2_IO_GAMEBTN_1);
+        assert_eq!(map_buttons(0x80, 0) & MAI2_IO_GAMEBTN_8, MAI2_IO_GAMEBTN_8);
+    }
+
+    #[test]
+    fn pack_legacy_touch_bits_packs_five_per_byte() {
+        let mut bits = [0u8; 5];
+        bits[0] |= 1 << 0; // sensor 0  -> out[0] bit 0
+        bits[4] |= 1 << 1; // sensor 33 -> out[6] bit 3
+        let out = pack_legacy_touch_bits(&bits);
+        assert_eq!(out[0], 0b0_0001);
+        assert_eq!(out[6], 0b0_1000);
+    }
+
+    #[test]
+    fn parse_0x01_frame_with_input() {
+        let mut frame = [0u8; 14];
+        frame[0] = 0xFF;
+        frame[1] = 0x01;
+        frame[2] = 0x0A;
+        frame[3] = 0x03; // buttons0 low nibble
+        frame[4] = 0x10; // buttons0 high nibble
+        frame[5] = 0x02; // io_status
+        frame[6] = 0b0_0001; // one touch bit set
+        add_checksum(&mut frame);
+
+        let mut buf = [0u8; AFFINE_SERIAL_RX_BUF_LEN];
+        buf[..14].copy_from_slice(&frame);
+        let mut len = 14usize;
+
+        match try_parse_frame(&mut buf, &mut len).expect("frame should parse") {
+            ParsedFrame::Touch {
+                buttons0,
+                io_status,
+                touch,
+            } => {
+                assert_eq!(buttons0, Some(0x13));
+                assert_eq!(io_status, Some(0x02));
+                assert_eq!(touch.unwrap()[0], 0b0_0001);
+            }
+            _ => panic!("expected a Touch frame"),
+        }
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn parser_resyncs_past_leading_garbage() {
+        let mut frame = [0u8; 14];
+        frame[0] = 0xFF;
+        frame[1] = 0x01;
+        frame[2] = 0x0A;
+        add_checksum(&mut frame); // idle (all-zero input) frame
+
+        let mut buf = [0u8; AFFINE_SERIAL_RX_BUF_LEN];
+        buf[0] = 0x99; // junk byte before the frame
+        buf[1..15].copy_from_slice(&frame);
+        let mut len = 15usize;
+
+        assert!(matches!(
+            try_parse_frame(&mut buf, &mut len),
+            Some(ParsedFrame::Touch { .. })
+        ));
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn parser_rejects_bad_checksum() {
+        let mut buf = [0u8; AFFINE_SERIAL_RX_BUF_LEN];
+        buf[0] = 0xFF;
+        buf[1] = 0x01;
+        buf[2] = 0x0A;
+        buf[6] = 0b0_0001; // input bit set, but checksum (buf[13]) left as 0
+        let mut len = 14usize;
+        assert!(try_parse_frame(&mut buf, &mut len).is_none());
+    }
 }

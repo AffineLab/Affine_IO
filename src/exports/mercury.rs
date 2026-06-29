@@ -3,9 +3,12 @@
 use affine_core::types::{Hresult, MercuryLedData, MercuryTouchCallback, S_OK, write_value};
 use affine_mercury as mercury;
 
+/// segatools mercuryio ABI version (high byte = major, low byte = minor).
+const MERCURY_IO_API_VERSION: u16 = 0x0100;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn mercury_io_get_api_version() -> u16 {
-    0x0100
+    MERCURY_IO_API_VERSION
 }
 
 #[unsafe(no_mangle)]
@@ -40,5 +43,7 @@ pub extern "C" fn mercury_io_touch_start(callback: MercuryTouchCallback) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn mercury_io_touch_set_leds(data: MercuryLedData) {
+    // Stored only; not forwarded to the device — see mercury_thread in the crate
+    // (the target firmware has no LED channel on this path).
     mercury::runtime().set_leds(data);
 }

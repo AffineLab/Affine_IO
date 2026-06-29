@@ -7,15 +7,14 @@ mod bench {
     use affine_chuni::runtime as chuni_runtime;
     use affine_core::serial::{SerialPort, find_com_port};
     use affine_core::slider::{SliderParser, find_any, send_slider_frame};
+    use affine_core::{AFFINE_VID, SERIAL_BAUD};
     use affine_mai2::runtime as mai2_runtime;
     use affine_mercury::runtime as mercury_runtime;
     use hidapi::{HidApi, HidDevice};
 
-    const AFFINE_VID: u16 = 0xAFF1;
     const MAI2_PID_1P: u16 = 0x52A5;
     const MAI2_PID_2P: u16 = 0x52A6;
     const CHUNI_PIDS: [u16; 2] = [0x52A4, 0x52A7];
-    const SERIAL_BAUD: u32 = 115_200;
     const BENCHMARK_CMD: u8 = 0x22;
     const BENCHMARK_EVENT_CMD: u8 = 0x23;
     const BENCHMARK_HID_EVENT_CMD: u8 = 0x24;

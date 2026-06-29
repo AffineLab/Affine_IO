@@ -1,5 +1,5 @@
 use crate::serial::find_com_port;
-use crate::util::{should_log, tick_ms};
+use crate::util::should_log;
 
 pub const SLIDER_CMD_AUTO_SCAN: u8 = 0x01;
 pub const SLIDER_CMD_SET_LED: u8 = 0x02;
@@ -116,6 +116,64 @@ impl SliderParser {
     }
 }
 
-pub fn now_ms() -> u64 {
-    tick_ms()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_slider_frame_builds_framed_checksum() {
+        let mut out = Vec::new();
+        let ok = send_slider_frame(
+            &mut |frame| {
+                out.extend_from_slice(frame);
+                true
+            },
+            SLIDER_CMD_AUTO_SCAN_START,
+            &[],
+        );
+        assert!(ok);
+        assert_eq!(out.len(), 4);
+        assert_eq!(&out[..3], &[0xFF, SLIDER_CMD_AUTO_SCAN_START, 0x00]);
+        let checksum = out[..3].iter().fold(0u8, |sum, &b| sum.wrapping_sub(b));
+        assert_eq!(out[3], checksum);
+    }
+
+    #[test]
+    fn slider_parser_decodes_a_frame() {
+        let mut parser = SliderParser::default();
+        // FF 01 02 AA BB <checksum> -> cmd 0x01, payload [AA, BB]
+        for byte in [0xFFu8, 0x01, 0x02, 0xAA, 0xBB] {
+            assert!(parser.push(byte).is_none());
+        }
+        let packet = parser.push(0x00).expect("frame should be complete");
+        assert_eq!(packet.cmd, 0x01);
+        assert_eq!(packet.payload, vec![0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn slider_parser_unescapes_0xfd() {
+        let mut parser = SliderParser::default();
+        // size=1; payload byte 0xFF is transmitted escaped as 0xFD 0xFE.
+        for byte in [0xFFu8, 0x01, 0x01] {
+            assert!(parser.push(byte).is_none());
+        }
+        assert!(parser.push(0xFD).is_none()); // escape marker
+        assert!(parser.push(0xFE).is_none()); // -> 0xFF payload byte
+        let packet = parser.push(0x00).expect("frame should be complete");
+        assert_eq!(packet.cmd, 0x01);
+        assert_eq!(packet.payload, vec![0xFF]);
+    }
+
+    #[test]
+    fn slider_parser_resets_on_new_start_byte() {
+        let mut parser = SliderParser::default();
+        assert!(parser.push(0x01).is_none()); // ignored: no active frame yet
+        assert!(parser.push(0xFF).is_none()); // start
+        assert!(parser.push(0xFF).is_none()); // restart, discards partial
+        assert!(parser.push(0x05).is_none());
+        assert!(parser.push(0x00).is_none()); // size 0
+        let packet = parser.push(0x00).expect("zero-payload frame");
+        assert_eq!(packet.cmd, 0x05);
+        assert!(packet.payload.is_empty());
+    }
 }

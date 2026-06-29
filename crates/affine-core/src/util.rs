@@ -123,11 +123,11 @@ pub fn segatools_config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".\\segatools.ini"))
 }
 
-pub fn ini_get_bool(path: &Path, section: &str, key: &str, default: bool) -> bool {
-    let Ok(contents) = fs::read_to_string(path) else {
-        return default;
-    };
-
+/// Read the raw trimmed value of `key` under `[section]` from an INI file.
+/// Section and key matching is case-insensitive; `;`/`#` lines are comments.
+/// Returns `None` if the file is unreadable or the key is absent.
+fn ini_get_raw(path: &Path, section: &str, key: &str) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
     let mut current_section = String::new();
 
     for raw_line in contents.lines() {
@@ -151,52 +151,24 @@ pub fn ini_get_bool(path: &Path, section: &str, key: &str, default: bool) -> boo
             continue;
         };
 
-        if !raw_key.trim().eq_ignore_ascii_case(key) {
-            continue;
+        if raw_key.trim().eq_ignore_ascii_case(key) {
+            return Some(raw_value.trim().to_string());
         }
-
-        return parse_bool(raw_value.trim()).unwrap_or(default);
     }
 
-    default
+    None
+}
+
+pub fn ini_get_bool(path: &Path, section: &str, key: &str, default: bool) -> bool {
+    ini_get_raw(path, section, key)
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(default)
 }
 
 pub fn ini_get_u32(path: &Path, section: &str, key: &str, default: u32) -> u32 {
-    let Ok(contents) = fs::read_to_string(path) else {
-        return default;
-    };
-
-    let mut current_section = String::new();
-
-    for raw_line in contents.lines() {
-        let line = raw_line.trim();
-
-        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
-            continue;
-        }
-
-        if line.starts_with('[') && line.ends_with(']') {
-            current_section.clear();
-            current_section.push_str(line[1..line.len() - 1].trim());
-            continue;
-        }
-
-        if !current_section.eq_ignore_ascii_case(section) {
-            continue;
-        }
-
-        let Some((raw_key, raw_value)) = line.split_once('=') else {
-            continue;
-        };
-
-        if !raw_key.trim().eq_ignore_ascii_case(key) {
-            continue;
-        }
-
-        return parse_u32(raw_value.trim()).unwrap_or(default);
-    }
-
-    default
+    ini_get_raw(path, section, key)
+        .and_then(|value| parse_u32(&value))
+        .unwrap_or(default)
 }
 
 pub fn current_exe_name() -> Option<String> {
@@ -242,5 +214,57 @@ fn parse_u32(value: &str) -> Option<u32> {
         u32::from_str_radix(hex, 16).ok()
     } else {
         value.parse::<u32>().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn parse_bool_variants() {
+        for v in ["1", "true", "TRUE", "yes", "on"] {
+            assert_eq!(parse_bool(v), Some(true), "{v}");
+        }
+        for v in ["0", "false", "No", "off"] {
+            assert_eq!(parse_bool(v), Some(false), "{v}");
+        }
+        assert_eq!(parse_bool("maybe"), None);
+    }
+
+    #[test]
+    fn parse_u32_dec_and_hex() {
+        assert_eq!(parse_u32("113"), Some(113));
+        assert_eq!(parse_u32("0x70"), Some(0x70));
+        assert_eq!(parse_u32("0X1a"), Some(0x1A));
+        assert_eq!(parse_u32("nope"), None);
+    }
+
+    #[test]
+    fn ini_reads_values_case_insensitively() {
+        let ini = "; a comment\n[Touch]\np1Enable = 1\np1DebugInput=0\n\n[io4]\ntest = 0x70\n";
+        let path = std::env::temp_dir().join("affine_core_ini_get_test.ini");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(ini.as_bytes())
+            .unwrap();
+
+        assert!(ini_get_bool(&path, "touch", "p1enable", false));
+        assert!(!ini_get_bool(&path, "TOUCH", "p1DebugInput", true));
+        assert_eq!(ini_get_u32(&path, "io4", "TEST", 0), 0x70);
+        // Missing key / section fall back to the default.
+        assert!(ini_get_bool(&path, "touch", "absent", true));
+        assert_eq!(ini_get_u32(&path, "absent", "test", 42), 42);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ini_missing_file_returns_default() {
+        let path = std::env::temp_dir().join("affine_core_ini_absent_xyz.ini");
+        let _ = std::fs::remove_file(&path);
+        assert!(ini_get_bool(&path, "s", "k", true));
+        assert_eq!(ini_get_u32(&path, "s", "k", 7), 7);
     }
 }

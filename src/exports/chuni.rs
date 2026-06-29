@@ -5,9 +5,12 @@ use affine_core::types::{
     ChuniSliderCallback, Hresult, S_OK, read_bytes, read_mut_bytes, write_value,
 };
 
+/// segatools chuniio ABI version (high byte = major, low byte = minor).
+const CHUNI_IO_API_VERSION: u16 = 0x0102;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn chuni_io_get_api_version() -> u16 {
-    0x0102
+    CHUNI_IO_API_VERSION
 }
 
 #[unsafe(no_mangle)]

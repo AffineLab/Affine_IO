@@ -10,8 +10,11 @@ use affine_core::slider::{
 };
 use affine_core::types::{Hresult, MercuryLedData, MercuryTouchCallback, S_OK};
 use affine_core::util::{log_ok, log_warn, sleep_ms};
+use affine_core::{AFFINE_VID, SERIAL_BAUD};
 
-const AFFINE_VID: u16 = 0xAFF1;
+// NOTE: 0x52A5 is the same USB identity as mai2 player 1 (MAI2_PID_1P). Mercury
+// hardware enumerates under the mai2 P1 PID, so this reuse is intentional — but only
+// one of the two runtimes may own the COM port at a time.
 const MERCURY_PIDS: [u16; 1] = [0x52A5];
 
 const MERCURY_STATE_MAPPING_NAME: &str = "mercury_io_shm";
@@ -134,7 +137,7 @@ fn mercury_thread(runtime: Arc<MercuryRuntime>) {
                 continue;
             };
 
-            if !port.open(&path, 115_200) {
+            if !port.open(&path, SERIAL_BAUD) {
                 if should_log_scan(&mut last_scan_log) {
                     log_warn(&format!("Mercury touch: failed to open {path}"));
                 }
@@ -165,6 +168,10 @@ fn mercury_thread(runtime: Arc<MercuryRuntime>) {
         }
         last_active = active;
 
+        // Mercury LED output is intentionally NOT forwarded to the device: the target
+        // firmware exposes no LED channel on this path. We consume the sequence so the
+        // change isn't re-evaluated every loop; set_leds stays wired for parity with
+        // the other runtimes and possible future firmware support.
         if control.leds_sequence != last_leds_sequence {
             last_leds_sequence = control.leds_sequence;
         }
