@@ -382,12 +382,11 @@ impl Mai2Runtime {
             let serial_shared = shared.clone();
             let vendor_device = device.clone();
             let vendor_shared = shared.clone();
-            let touch_hid_device = device.clone();
-            let touch_hid_shared = shared.clone();
             let touch_device = device.clone();
             let touch_shared = shared.clone();
             thread::spawn(move || vendor_command_thread(vendor_device, vendor_shared));
-            thread::spawn(move || touch_hid_thread(touch_hid_device, touch_hid_shared));
+            // Touch now rides the button/input HID (MI_01) alongside buttons; the
+            // separate Touch-Stream HID (MI_05) reader is no longer used.
             thread::spawn(move || device_thread(serial_device, serial_shared));
             thread::spawn(move || hid_thread(device, shared));
             thread::spawn(move || touch_callback_thread(touch_device, touch_shared));
@@ -1301,6 +1300,9 @@ fn vendor_command_read_once(
     }
 }
 
+// Retained for reference / fallback: touch now arrives via the input HID (MI_01),
+// so the dedicated Touch-Stream HID (MI_05) reader is no longer spawned.
+#[allow(dead_code)]
 fn touch_hid_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
     let mut hid_unavailable_logged = false;
     let mut hid_missing_logged = false;
@@ -1458,8 +1460,12 @@ fn hid_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
         };
         hid_open_failed_logged = false;
 
-        log_ok(&format!("Connected P{} HID buttons", device.player));
+        log_ok(&format!(
+            "Connected P{} HID input (buttons+touch)",
+            device.player
+        ));
         device.hid_connected.store(true, Ordering::SeqCst);
+        device.touch_hid_connected.store(true, Ordering::SeqCst);
 
         loop {
             let mut report = [0u8; MAI2_BUTTON_HID_REPORT_LEN];
@@ -1475,13 +1481,23 @@ fn hid_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
                     if report[1] > 0x3F || (report[0] == 0xA5 && report[1] == 0x5A) {
                         continue;
                     }
+                    // The input HID (MI_01) now carries the 34-channel touch bitmap in
+                    // report[4..9); pack it into the legacy 7-byte layout. Touch and
+                    // buttons arrive together in one report — no separate touch stream.
+                    let touch = if read >= 9 {
+                        let mut touch_bits = [0u8; 5];
+                        touch_bits.copy_from_slice(&report[4..9]);
+                        Some(pack_legacy_touch_bits(&touch_bits))
+                    } else {
+                        None
+                    };
                     apply_device_frame(
                         &device,
                         &shared,
                         Some(report[0]),
                         Some(report[1]),
-                        None,
-                        TouchSource::Synthetic,
+                        touch,
+                        TouchSource::TouchHid,
                     );
                 }
                 Ok(_) => continue,
@@ -1490,6 +1506,7 @@ fn hid_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
         }
 
         device.hid_connected.store(false, Ordering::SeqCst);
+        device.touch_hid_connected.store(false, Ordering::SeqCst);
         clear_inputs_on_source_drop(&device);
         sleep_ms(AFFINE_RESCAN_INTERVAL_MS);
     }
@@ -1595,6 +1612,17 @@ fn touch_callback_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
                     touch[4],
                     touch[5],
                     touch[6],
+                ));
+                let (btn0, io_status) = {
+                    let page = device.input_page.read();
+                    (page.buttons0, page.io_status)
+                };
+                log_diag(&format!(
+                    "P{} diag input btn0={:02X} io={:02X} game={:04X}",
+                    device.player,
+                    btn0,
+                    io_status,
+                    map_buttons(btn0, io_status),
                 ));
 
                 last_diag_ms = now;
