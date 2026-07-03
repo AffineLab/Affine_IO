@@ -87,7 +87,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Tags with a semver pre-release suffix (e.g. v1.2.0-rc.1) publish as pre-releases.
+          PRERELEASE=""
+          if [[ "${{ github.ref_name }}" == *-* ]]; then
+            PRERELEASE="--prerelease"
+          fi
           gh release create "${{ github.ref_name }}" dist/*.dll \
             --repo "${{ github.repository }}" \
             --title "${{ github.ref_name }}" \
-            --generate-notes
+            --generate-notes $PRERELEASE
