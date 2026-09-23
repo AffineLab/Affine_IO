@@ -35,6 +35,8 @@ Configuration is read from `SEGATOOLS_CONFIG_PATH` if set, otherwise from
 
 - `mai2`: USB-HID is the primary transport; the USB-CDC serial path is kept as a
   fallback. Touch, buttons, and LEDs are carried over whichever link is live.
+  Input is never read from the Vendor HID command interface: it carries the
+  replies to every host's commands, so only the board-info reply is used there.
 - `chuni` / `mercury`: the touch slider runs over USB-CDC serial.
 - `aime`: the Monica NFC reader runs over Sega serial.
 

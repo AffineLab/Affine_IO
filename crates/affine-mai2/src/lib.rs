@@ -402,10 +402,9 @@ impl Mai2Runtime {
             let serial_device = device.clone();
             let serial_shared = shared.clone();
             let vendor_device = device.clone();
-            let vendor_shared = shared.clone();
             let touch_device = device.clone();
             let touch_shared = shared.clone();
-            thread::spawn(move || vendor_command_thread(vendor_device, vendor_shared));
+            thread::spawn(move || vendor_command_thread(vendor_device));
             // Touch now rides the button/input HID (MI_01) alongside buttons; the
             // separate Touch-Stream HID (MI_05) reader is no longer used.
             thread::spawn(move || device_thread(serial_device, serial_shared));
@@ -1024,14 +1023,19 @@ fn disconnect_session(
 /// Zero the input fields a just-dropped source was feeding, but only when no other
 /// live source still provides them. Prevents a disconnected HID source from leaving
 /// the game reading held buttons/touch across a reconnect; the next live source
-/// overwrites within one frame. Buttons are served by the button-HID thread or the
-/// vendor command stream; touch by the touch-HID thread or the vendor command stream.
+/// overwrites within one frame.
+///
+/// Liveness keys only on the input HID flags, NOT `vendor_connected`: the vendor
+/// endpoint carries command replies, not gameplay input, and on a composite
+/// re-enumeration it drops together with the input HID but may clear its flag a
+/// beat later. Counting it here let a stale `vendor_connected=true` mask a real
+/// MI_01 drop and freeze buttons+touch at their held value. If a firmware ever
+/// does stream input over the vendor channel, its next frame refills within one
+/// game frame, so dropping it from the gate is safe either way.
 /// Call AFTER the dropped source has cleared its own `*_connected` flag.
 fn clear_inputs_on_source_drop(device: &DeviceHandle) {
-    let buttons_live = device.hid_connected.load(Ordering::SeqCst)
-        || device.vendor_connected.load(Ordering::SeqCst);
-    let touch_live = device.touch_hid_connected.load(Ordering::SeqCst)
-        || device.vendor_connected.load(Ordering::SeqCst);
+    let buttons_live = device.hid_connected.load(Ordering::SeqCst);
+    let touch_live = device.touch_hid_connected.load(Ordering::SeqCst);
     if buttons_live && touch_live {
         return;
     }
@@ -1052,7 +1056,7 @@ fn clear_inputs_on_source_drop(device: &DeviceHandle) {
     });
 }
 
-fn vendor_command_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
+fn vendor_command_thread(device: Arc<DeviceHandle>) {
     let mut hid_unavailable_logged = false;
     let mut hid_missing_logged = false;
     let mut hid_open_failed_logged = false;
@@ -1136,7 +1140,6 @@ fn vendor_command_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
             if !vendor_command_read_once(
                 &hid,
                 &device,
-                &shared,
                 &mut board_info_pending,
                 &mut board_info_logged,
             ) {
@@ -1220,10 +1223,12 @@ fn vendor_command_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
     }
 }
 
+/// Read one Vendor HID IN report. Only the board-info reply is used from it: this
+/// endpoint never carries input (see `vendor_report_board_info`), so nothing read
+/// here reaches the input page.
 fn vendor_command_read_once(
     hid: &HidDevice,
     device: &DeviceHandle,
-    shared: &SharedState,
     board_info_pending: &mut bool,
     board_info_logged: &mut bool,
 ) -> bool {
@@ -1232,33 +1237,10 @@ fn vendor_command_read_once(
     match hid.read_timeout(&mut report, MAI2_VENDOR_HID_READ_TIMEOUT_MS) {
         Ok(0) => true,
         Ok(read) => {
-            let mut rx_buf = [0u8; AFFINE_SERIAL_RX_BUF_LEN];
-            let mut rx_len = read.min(rx_buf.len());
-            rx_buf[..rx_len].copy_from_slice(&report[..rx_len]);
-
-            while let Some(frame) = try_parse_frame(&mut rx_buf, &mut rx_len) {
-                match frame {
-                    ParsedFrame::Touch {
-                        buttons0,
-                        io_status,
-                        touch,
-                    } => {
-                        let use_hid_buttons = !device.hid_connected.load(Ordering::SeqCst);
-                        apply_device_frame(
-                            device,
-                            shared,
-                            if use_hid_buttons { buttons0 } else { None },
-                            if use_hid_buttons { io_status } else { None },
-                            touch,
-                            TouchSource::Synthetic,
-                        );
-                    }
-                    ParsedFrame::BoardInfo(version) => {
-                        *board_info_pending = false;
-                        *board_info_logged = true;
-                        log_line(&format!("P{} Firmware: {version}", device.player));
-                    }
-                }
+            if let Some(version) = vendor_report_board_info(&report[..read.min(report.len())]) {
+                *board_info_pending = false;
+                *board_info_logged = true;
+                log_line(&format!("P{} Firmware: {version}", device.player));
             }
             true
         }
@@ -1608,6 +1590,7 @@ fn touch_callback_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
     }
 }
 
+#[cfg_attr(test, derive(Debug, PartialEq))]
 enum ParsedFrame {
     Touch {
         buttons0: Option<u8>,
@@ -1621,6 +1604,8 @@ enum ParsedFrame {
 enum TouchSource {
     Serial,
     TouchHid,
+    /// Injected by the latency bench; not counted as a serial or HID frame.
+    #[cfg(feature = "latency-bench")]
     Synthetic,
 }
 
@@ -1663,6 +1648,11 @@ impl TouchHidAssembler {
     }
 }
 
+/// Parse the USB-CDC serial byte stream. This DLL holds the COM port exclusively,
+/// so everything on it is the firmware's reply to our commands or its live
+/// stream. Frames may split across reads, so this scans and resyncs byte by byte.
+/// Never feed it Vendor HID reports: those carry every host's replies, and a
+/// scan finds touch frames inside their payloads (use `parse_vendor_reply`).
 fn try_parse_frame(rx_buf: &mut [u8], rx_len: &mut usize) -> Option<ParsedFrame> {
     loop {
         if *rx_len == 0 {
@@ -1756,6 +1746,59 @@ fn parse_board_info(data: &[u8]) -> String {
     }
 
     String::from_utf8_lossy(&data[1..1 + length]).into_owned()
+}
+
+/// One command-reply frame read from a Vendor HID IN report.
+#[derive(Debug, PartialEq, Eq)]
+struct VendorReply<'a> {
+    cmd: u8,
+    payload: &'a [u8],
+}
+
+/// Parse one Vendor HID IN report (usage 0xFFCA/0x0002, no report ID, 64 bytes).
+///
+/// That endpoint is the firmware's command-reply channel, and Windows hands each
+/// report to every open handle, so the replies to other hosts' commands (the Hub,
+/// AquaMai, scripts) arrive here too. The firmware puts one reply per report at
+/// byte 0, zero-padded: `FF cmd len payload[len] sum8`, sum8 being the byte sum
+/// of everything before it. So a reply is a frame anchored at byte 0 whose
+/// declared length fits in the report and whose checksum matches. Nothing is
+/// searched for past byte 0: unlike the CDC stream there is nothing to resync,
+/// and a scan finds frames inside binary payloads (u16/u32 stats, raw values).
+fn parse_vendor_reply(report: &[u8]) -> Option<VendorReply<'_>> {
+    let frame = &report[..report.len().min(MAI2_VENDOR_HID_FRAME_LEN)];
+    if frame.len() < 4 || frame[0] != 0xFF {
+        return None;
+    }
+
+    let sum_index = 3 + frame[2] as usize;
+    if sum_index >= frame.len() {
+        return None;
+    }
+    let sum = frame[..sum_index]
+        .iter()
+        .fold(0u8, |acc, &byte| acc.wrapping_add(byte));
+    if frame[sum_index] != sum {
+        return None;
+    }
+
+    Some(VendorReply {
+        cmd: frame[1],
+        payload: &frame[3..sum_index],
+    })
+}
+
+/// The one thing the IO takes from a Vendor HID IN report: the firmware version
+/// from a board-info (0xF0) reply. Every other reply answers some host's command
+/// and is dropped. Input never comes from this endpoint: no firmware sends its
+/// live stream (FF 01 or "(...)" touch frames) there; that goes to the COM port,
+/// and the input HID (MI_01) carries buttons and touch.
+fn vendor_report_board_info(report: &[u8]) -> Option<String> {
+    let reply = parse_vendor_reply(report)?;
+    if reply.cmd != AFFINE_CMD_GET_BOARD_INFO {
+        return None;
+    }
+    Some(parse_board_info(reply.payload))
 }
 
 fn send_hid_frame(hid: &HidDevice, cmd: u8, payload: &[u8]) -> bool {
@@ -1883,6 +1926,7 @@ fn apply_device_frame(
             TouchSource::TouchHid => {
                 device.touch_hid_frames.fetch_add(1, Ordering::SeqCst);
             }
+            #[cfg(feature = "latency-bench")]
             TouchSource::Synthetic => {}
         }
         device
@@ -2428,5 +2472,237 @@ mod tests {
         buf[6] = 0b0_0001; // input bit set, but checksum (buf[13]) left as 0
         let mut len = 14usize;
         assert!(try_parse_frame(&mut buf, &mut len).is_none());
+    }
+
+    // Firmware reply opcodes (serial_protocol.h) that other hosts ask for.
+    const FW_GET_USB_CDC_STATS: u8 = 0x19;
+    const FW_GET_RAW_DEBUG_SNAPSHOT: u8 = 0x27;
+    const FW_GET_LIVE_STATE: u8 = 0x28;
+
+    /// A Vendor HID IN report as the firmware sends it: one reply frame at byte 0,
+    /// `FF cmd len payload sum8`, zero-padded to 64 bytes.
+    fn vendor_report(cmd: u8, payload: &[u8]) -> [u8; MAI2_VENDOR_HID_FRAME_LEN] {
+        let mut report = [0u8; MAI2_VENDOR_HID_FRAME_LEN];
+        report[0] = 0xFF;
+        report[1] = cmd;
+        report[2] = payload.len() as u8;
+        report[3..3 + payload.len()].copy_from_slice(payload);
+        add_checksum(&mut report[..4 + payload.len()]);
+        report
+    }
+
+    /// The firmware's board-info (0xF0) payload: version, board name, 12-byte UID,
+    /// each behind its length byte.
+    fn board_info_payload(version: &str) -> Vec<u8> {
+        let mut payload = vec![version.len() as u8];
+        payload.extend_from_slice(version.as_bytes());
+        payload.push(11);
+        payload.extend_from_slice(b"1020-050201");
+        payload.push(12);
+        payload.extend_from_slice(&[
+            0x28, 0x00, 0x3A, 0x00, 0x12, 0x51, 0x4B, 0x46, 0x29, 0x20, 0x33, 0x33,
+        ]);
+        payload
+    }
+
+    /// Feed bytes to the CDC stream parser as `serial_reader_thread` does (one byte
+    /// at a time, parsing after each) and collect what it yields.
+    fn stream_frames(bytes: &[u8]) -> Vec<ParsedFrame> {
+        let mut rx_buf = [0u8; AFFINE_SERIAL_RX_BUF_LEN];
+        let mut rx_len = 0usize;
+        let mut frames = Vec::new();
+        for &byte in bytes {
+            if rx_len >= rx_buf.len() {
+                rx_len = 0;
+            }
+            rx_buf[rx_len] = byte;
+            rx_len += 1;
+            while let Some(frame) = try_parse_frame(&mut rx_buf, &mut rx_len) {
+                frames.push(frame);
+            }
+        }
+        frames
+    }
+
+    fn stream_touch_count(bytes: &[u8]) -> usize {
+        stream_frames(bytes)
+            .iter()
+            .filter(|frame| matches!(frame, ParsedFrame::Touch { .. }))
+            .count()
+    }
+
+    #[test]
+    fn vendor_stats_reply_with_paren_bytes_is_not_touch() {
+        // GET_USB_CDC_STATS: 14 little-endian u32 counters, 60 bytes on the wire.
+        // Counter 0 = 40 (0x28) and counter 2 = 41 (0x29) put '(' at report byte 3
+        // and ')' at byte 11, eight apart: an ASCII touch frame to a byte scan.
+        let mut counters = [0u32; 14];
+        counters[0] = 0x28;
+        counters[1] = 0x15; // lands in the bytes the scan takes as touch
+        counters[2] = 0x29;
+        counters[4] = 1_234_567;
+        let payload: Vec<u8> = counters.iter().flat_map(|c| c.to_le_bytes()).collect();
+        let report = vendor_report(FW_GET_USB_CDC_STATS, &payload);
+        assert_eq!(report.len(), 64);
+
+        // Control: the byte-stream scan the vendor path used to run reads a touch here.
+        assert_eq!(stream_touch_count(&report), 1);
+
+        let reply = parse_vendor_reply(&report).expect("a well-formed stats reply");
+        assert_eq!(reply.cmd, FW_GET_USB_CDC_STATS);
+        assert_eq!(reply.payload, &payload[..]);
+        assert_eq!(vendor_report_board_info(&report), None);
+    }
+
+    #[test]
+    fn vendor_reply_with_an_embedded_ff01_frame_is_not_input() {
+        // GET_RAW_DEBUG_SNAPSHOT: seq, part, parts, then 17 raw u16 values. Raw values
+        // are arbitrary, so the payload can hold a whole FF 01 0A frame with a valid
+        // sum: 1P button 1, function byte 0x3F, touch A1.
+        let mut inner = [0u8; 14];
+        inner[..6].copy_from_slice(&[0xFF, 0x01, 0x0A, 0x01, 0x00, 0x3F]);
+        inner[6] = 0b0_0001;
+        add_checksum(&mut inner);
+        let mut payload = vec![7, 0, 2];
+        payload.extend_from_slice(&inner);
+        payload.resize(3 + 17 * 2, 0x55);
+        let report = vendor_report(FW_GET_RAW_DEBUG_SNAPSHOT, &payload);
+
+        // Control: the byte-stream scan finds the inner frame, buttons and all.
+        assert_eq!(
+            stream_frames(&report),
+            vec![ParsedFrame::Touch {
+                buttons0: Some(0x01),
+                io_status: Some(0x3F),
+                touch: Some([0b0_0001, 0, 0, 0, 0, 0, 0]),
+            }]
+        );
+
+        let reply = parse_vendor_reply(&report).expect("a well-formed raw-debug reply");
+        assert_eq!(reply.cmd, FW_GET_RAW_DEBUG_SNAPSHOT);
+        assert_eq!(vendor_report_board_info(&report), None);
+    }
+
+    #[test]
+    fn vendor_board_info_reply_parses() {
+        let payload = board_info_payload("v1.6.2-beta.3");
+        let report = vendor_report(AFFINE_CMD_GET_BOARD_INFO, &payload);
+        assert_eq!(
+            vendor_report_board_info(&report).as_deref(),
+            Some("v1.6.2-beta.3")
+        );
+
+        // A short read that still holds the whole frame parses the same.
+        let frame_len = 4 + payload.len();
+        assert_eq!(
+            vendor_report_board_info(&report[..frame_len]).as_deref(),
+            Some("v1.6.2-beta.3")
+        );
+        // One byte short of the checksum does not.
+        assert_eq!(vendor_report_board_info(&report[..frame_len - 1]), None);
+    }
+
+    #[test]
+    fn vendor_reply_must_start_at_byte_zero() {
+        let frame = vendor_report(AFFINE_CMD_GET_BOARD_INFO, &board_info_payload("v1.6.1"));
+        let mut shifted = [0u8; MAI2_VENDOR_HID_FRAME_LEN];
+        shifted[1..].copy_from_slice(&frame[..MAI2_VENDOR_HID_FRAME_LEN - 1]);
+        assert_eq!(parse_vendor_reply(&shifted), None);
+        assert_eq!(vendor_report_board_info(&shifted), None);
+
+        // Byte 0 must be the FF itself: the same frame led by another byte is refused
+        // even with its length intact and its sum recomputed over that byte.
+        let mut not_ff = frame;
+        not_ff[0] = 0xFE;
+        let sum_index = 3 + not_ff[2] as usize;
+        add_checksum(&mut not_ff[..=sum_index]);
+        assert_eq!(parse_vendor_reply(&not_ff), None);
+        assert_eq!(vendor_report_board_info(&not_ff), None);
+    }
+
+    #[test]
+    fn vendor_reply_needs_a_matching_checksum_and_a_length_that_fits() {
+        let mut report = vendor_report(AFFINE_CMD_GET_BOARD_INFO, &board_info_payload("v1.6.1"));
+        let sum_index = 3 + report[2] as usize;
+        report[sum_index] = report[sum_index].wrapping_add(1);
+        assert_eq!(parse_vendor_reply(&report), None);
+
+        // The longest reply a 64-byte report holds: 60 payload bytes, sum at byte 63.
+        let longest = vendor_report(FW_GET_USB_CDC_STATS, &[0x11; 60]);
+        assert_eq!(
+            parse_vendor_reply(&longest).map(|r| r.payload.len()),
+            Some(60)
+        );
+
+        // A declared length whose checksum would sit past the report is refused.
+        let mut overlong = longest;
+        overlong[2] = 61;
+        assert_eq!(parse_vendor_reply(&overlong), None);
+        overlong[2] = 0xFF;
+        assert_eq!(parse_vendor_reply(&overlong), None);
+
+        assert_eq!(parse_vendor_reply(&[0xFF, 0xF0, 0x00]), None);
+        assert_eq!(parse_vendor_reply(&[]), None);
+    }
+
+    #[test]
+    fn vendor_path_never_yields_input() {
+        // The legacy "(LAr2)" ack, which v1.3.0-v1.4.1 firmware sent to vendor HID.
+        let mut ack = [0u8; MAI2_VENDOR_HID_FRAME_LEN];
+        ack[..6].copy_from_slice(b"(LAr2)");
+        assert_eq!(parse_vendor_reply(&ack), None);
+
+        // An ASCII touch frame at byte 0: not a reply, and never touch on this path.
+        let mut ascii_touch = [0u8; MAI2_VENDOR_HID_FRAME_LEN];
+        ascii_touch[0] = b'(';
+        ascii_touch[1] = 0b1_1111;
+        ascii_touch[8] = b')';
+        assert_eq!(parse_vendor_reply(&ascii_touch), None);
+
+        // A live-state frame (the Hub's GET_LIVE_STATE, or an FF 01 frame) is a
+        // well-formed reply but not the board info: its input is not taken.
+        let live = [0x01, 0x00, 0x3F, 0b1_1111, 0, 0, 0, 0, 0, 0];
+        for cmd in [FW_GET_LIVE_STATE, 0x01] {
+            let report = vendor_report(cmd, &live);
+            assert_eq!(parse_vendor_reply(&report).map(|r| r.cmd), Some(cmd));
+            assert_eq!(vendor_report_board_info(&report), None);
+        }
+    }
+
+    #[test]
+    fn stream_parser_still_reads_touch_and_board_info() {
+        // The CDC stream path is unchanged: ASCII touch, FF 01 input and board-info
+        // frames are still found, including after junk, in one byte stream.
+        let mut live = [0u8; 14];
+        live[..6].copy_from_slice(&[0xFF, 0x01, 0x0A, 0x02, 0x40, 0x10]);
+        live[12] = 0b0_0100;
+        add_checksum(&mut live);
+        let board_info = board_info_payload("v1.2.0");
+        let mut info = vec![0xFF, AFFINE_CMD_GET_BOARD_INFO, board_info.len() as u8];
+        info.extend_from_slice(&board_info);
+        info.push(0);
+        add_checksum(&mut info);
+
+        let mut stream = vec![0x99];
+        stream.extend_from_slice(&[b'(', 1, 2, 3, 4, 5, 6, 7, b')']);
+        stream.extend_from_slice(&live);
+        stream.extend_from_slice(&info);
+
+        assert_eq!(
+            stream_frames(&stream),
+            vec![
+                ParsedFrame::Touch {
+                    buttons0: None,
+                    io_status: None,
+                    touch: Some([1, 2, 3, 4, 5, 6, 7]),
+                },
+                ParsedFrame::Touch {
+                    buttons0: Some(0x42),
+                    io_status: Some(0x10),
+                    touch: Some([0, 0, 0, 0, 0, 0, 0b0_0100]),
+                },
+                ParsedFrame::BoardInfo(String::from("v1.2.0")),
+            ]
+        );
     }
 }
