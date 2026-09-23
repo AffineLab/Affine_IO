@@ -52,6 +52,34 @@ tools can mirror it. `mai2` exposes its input pages under the `mai_io_shm_1` and
 - `[io4] test` / `service` / `coin`: virtual-key codes for the operator-button
   keyboard fallback (default `VK_F1` / `VK_F2` / `VK_F3`).
 
+### `mai2` function buttons
+
+Each board sends its six function buttons as one byte, one bit per pin:
+
+| Bit | Pin | Button | Game input |
+|:--|:--|:--|:--|
+| 0 | PC4 | Test | Test, from either board |
+| 1 | PB0 | Service | Service, from either board |
+| 2 | PB1 | Coin | one credit per press, from either board |
+| 3 | PB2 | Card scan | not read by Affine IO: the board's own keyboard sends Enter, which segatools' built-in Aime emulation reads as `[aime] scan` |
+| 4 | PB10 | 1P Select | player 1 Select, from either board |
+| 5 | PB11 | 2P Select | player 2 Select, from either board |
+
+The pin decides the player, not the board, so a board wired with both Select
+buttons gives both players their Select. Wire the 2P board's Select to PB11: on
+PB10 it is player 1's Select.
+
+**Upgrading from v1.1.2 or v1.2.0-rc.1:** those versions read this byte one
+place off. Test acted as that player's Select, Service acted as Test, Coin acted
+as Service (so neither board's Coin gave a credit), the 1P card-scan key acted
+as Coin (so a card tap also gave a credit), and both Select buttons did nothing.
+This version restores the labels on the buttons. If you relabelled or rewired
+buttons to work around the old mapping, undo that. CurvaMods builds made before
+its own function-button fix read the byte the same old way and add it to the
+game's input, so update CurvaMods together with this version: with an old build,
+Test, Service and Coin each also press a second button (Test also presses
+Select).
+
 ## CI
 
 GitHub Actions includes:

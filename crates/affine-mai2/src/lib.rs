@@ -66,10 +66,28 @@ const MAI2_IO_GAMEBTN_7: u16 = 0x40;
 const MAI2_IO_GAMEBTN_8: u16 = 0x80;
 const MAI2_IO_GAMEBTN_SELECT: u16 = 0x100;
 
-const MAI2_AFFINE_EXT_SELECT_BIT: u8 = 0;
-const MAI2_AFFINE_EXT_TEST_BIT: u8 = 1;
-const MAI2_AFFINE_EXT_SERVICE_BIT: u8 = 2;
-const MAI2_AFFINE_EXT_COIN_BIT: u8 = 3;
+// Function-button byte: the firmware's button_bits[1], one bit per pin, sent
+// unchanged as MI_01 report[1] and CDC FF 01 byte 5, and stored raw as
+// `Mai2InputPage::io_status`. The firmware has sent this layout since G431
+// 992fe72, and Qinh's paired mai2io DLL, Curva_IO, curva_test and the firmware
+// keyboard (F1/F2/F3) all read it this way. v1.1.2 and v1.2.0-rc.1 decoded it as
+// Select=0/Test=1/Service=2/Coin=3, an order copied from Af_mai 6a4d43b
+// (2025-12-20). That order was wrong: the firmware never changed the byte, so
+// every function button moved one place and both Selects went dead.
+//   bit0 PC4  Test          -> opbtn TEST, from either board
+//   bit1 PB0  Service       -> opbtn SERVICE, from either board
+//   bit2 PB1  Coin          -> opbtn COIN, from either board
+//   bit3 PB2  card scan     -> not decoded: the firmware keyboard sends Enter,
+//                              which segatools aimeio reads as [aime] scan
+//   bit4 PB10 1P Select     -> player 1 SELECT, from either board
+//   bit5 PB11 2P Select     -> player 2 SELECT, from either board
+// The pin picks the player, not the board, so a board wired with both Selects
+// still gives both players their Select.
+const MAI2_AFFINE_FN_TEST_BIT: u8 = 0;
+const MAI2_AFFINE_FN_SERVICE_BIT: u8 = 1;
+const MAI2_AFFINE_FN_COIN_BIT: u8 = 2;
+const MAI2_AFFINE_FN_P1_SELECT_BIT: u8 = 4;
+const MAI2_AFFINE_FN_P2_SELECT_BIT: u8 = 5;
 
 const MAI2_INPUT_MAPPING_NAMES: [&str; 2] = ["mai_io_shm_1", "mai_io_shm_2"];
 const MAI2_INPUT_MUTEX_NAMES: [&str; 2] = ["mai_io_shm_1_mutex", "mai_io_shm_2_mutex"];
@@ -82,6 +100,9 @@ const MAI2_POLL_MUTEX_NAME: &str = "mai_io_poll_mutex";
 #[derive(Clone, Copy, Default)]
 struct Mai2InputPage {
     buttons0: u8,
+    // Raw function-button byte (MAI2_AFFINE_FN_*), decoded only in decode_poll.
+    // Kept raw: the legacy C mai2io put the same byte at mai_io_shm_N[1], so
+    // tools that mirror these pages see the firmware's own bit layout.
     io_status: u8,
     connected: u8,
     _reserved0: [u8; 5],
@@ -399,65 +420,10 @@ impl Mai2Runtime {
     pub fn poll(&self) -> Hresult {
         let p1 = self.devices[0].input_page.read();
         let p2 = self.devices[1].input_page.read();
+        let keys = KeyboardOpbtns::read(&self.keyboard, key_down);
 
-        self.poll_page.update(|poll_state| {
-            let mut opbtn = 0;
-            let mut player1_btn = 0;
-            let mut player2_btn = 0;
-            let mut coin_pressed = false;
-
-            if p1.connected != 0 {
-                player1_btn = map_buttons(p1.buttons0, p1.io_status);
-
-                if p1.io_status & (1 << MAI2_AFFINE_EXT_TEST_BIT) != 0 {
-                    opbtn |= MAI2_IO_OPBTN_TEST;
-                }
-                if p1.io_status & (1 << MAI2_AFFINE_EXT_SERVICE_BIT) != 0 {
-                    opbtn |= MAI2_IO_OPBTN_SERVICE;
-                }
-                if p1.io_status & (1 << MAI2_AFFINE_EXT_COIN_BIT) != 0 {
-                    coin_pressed = true;
-                }
-            }
-
-            if p2.connected != 0 {
-                player2_btn = map_buttons(p2.buttons0, p2.io_status);
-
-                if p2.io_status & (1 << MAI2_AFFINE_EXT_TEST_BIT) != 0 {
-                    opbtn |= MAI2_IO_OPBTN_TEST;
-                }
-                if p2.io_status & (1 << MAI2_AFFINE_EXT_SERVICE_BIT) != 0 {
-                    opbtn |= MAI2_IO_OPBTN_SERVICE;
-                }
-            }
-
-            if key_down(self.keyboard.vk_test) {
-                opbtn |= MAI2_IO_OPBTN_TEST;
-            }
-            if key_down(self.keyboard.vk_service) {
-                opbtn |= MAI2_IO_OPBTN_SERVICE;
-            }
-            if key_down(self.keyboard.vk_coin) {
-                coin_pressed = true;
-            }
-
-            // Coin is an edge-triggered pulse: assert OPBTN_COIN for exactly one
-            // poll on the rising edge so a held coin source (hardware OR keyboard)
-            // registers a single credit instead of repeating every poll.
-            if coin_pressed {
-                if poll_state.affine_coin == 0 {
-                    poll_state.affine_coin = 1;
-                    opbtn |= MAI2_IO_OPBTN_COIN;
-                }
-            } else {
-                poll_state.affine_coin = 0;
-            }
-
-            poll_state.opbtn = opbtn;
-            poll_state.player1_btn = player1_btn;
-            poll_state.player2_btn = player2_btn;
-            poll_state.sequence = poll_state.sequence.wrapping_add(1);
-        });
+        self.poll_page
+            .update(|poll_state| apply_poll(poll_state, &p1, &p2, keys));
 
         S_OK
     }
@@ -1622,7 +1588,7 @@ fn touch_callback_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
                     device.player,
                     btn0,
                     io_status,
-                    map_buttons(btn0, io_status),
+                    map_buttons(btn0),
                 ));
 
                 last_diag_ms = now;
@@ -1925,7 +1891,106 @@ fn apply_device_frame(
     }
 }
 
-fn map_buttons(buttons0: u8, buttons1: u8) -> u16 {
+/// Operator keys held on the keyboard fallback (`[io4] test/service/coin`) this poll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyboardOpbtns {
+    test: bool,
+    service: bool,
+    coin: bool,
+}
+
+impl KeyboardOpbtns {
+    /// `key_down` is `GetAsyncKeyState` in the DLL; a parameter so tests can hold keys.
+    fn read(config: &KeyboardConfig, key_down: impl Fn(u16) -> bool) -> Self {
+        Self {
+            test: key_down(config.vk_test),
+            service: key_down(config.vk_service),
+            coin: key_down(config.vk_coin),
+        }
+    }
+}
+
+/// One poll's result, as mai2_io_get_opbtns / mai2_io_get_gamebtns return it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PollButtons {
+    opbtn: u8,
+    player1_btn: u16,
+    player2_btn: u16,
+}
+
+/// Combine both boards' input pages and the keyboard fallback into one poll.
+/// `coin_latch` is the poll page's `affine_coin`, kept across polls for the coin edge.
+fn decode_poll(
+    p1: &Mai2InputPage,
+    p2: &Mai2InputPage,
+    keys: KeyboardOpbtns,
+    coin_latch: &mut u8,
+) -> PollButtons {
+    let mut out = PollButtons::default();
+    // No function bit depends on which board sent it: Test/Service/Coin are
+    // cabinet-wide and each Select pin names its player. So OR the connected
+    // boards' bytes and decode them once.
+    let mut fn_bits = 0u8;
+
+    if p1.connected != 0 {
+        out.player1_btn = map_buttons(p1.buttons0);
+        fn_bits |= p1.io_status;
+    }
+    if p2.connected != 0 {
+        out.player2_btn = map_buttons(p2.buttons0);
+        fn_bits |= p2.io_status;
+    }
+
+    if fn_bits & (1 << MAI2_AFFINE_FN_TEST_BIT) != 0 || keys.test {
+        out.opbtn |= MAI2_IO_OPBTN_TEST;
+    }
+    if fn_bits & (1 << MAI2_AFFINE_FN_SERVICE_BIT) != 0 || keys.service {
+        out.opbtn |= MAI2_IO_OPBTN_SERVICE;
+    }
+    if fn_bits & (1 << MAI2_AFFINE_FN_P1_SELECT_BIT) != 0 {
+        out.player1_btn |= MAI2_IO_GAMEBTN_SELECT;
+    }
+    if fn_bits & (1 << MAI2_AFFINE_FN_P2_SELECT_BIT) != 0 {
+        out.player2_btn |= MAI2_IO_GAMEBTN_SELECT;
+    }
+
+    // Coin is an edge-triggered pulse: assert OPBTN_COIN for exactly one
+    // poll on the rising edge so a held coin source (either board OR keyboard)
+    // registers a single credit instead of repeating every poll. The edge runs on
+    // the OR of all sources, so two boards holding Coin still give one credit, and
+    // a board that disconnects mid-press just drops out of the level.
+    let coin_held = fn_bits & (1 << MAI2_AFFINE_FN_COIN_BIT) != 0 || keys.coin;
+    if coin_held {
+        if *coin_latch == 0 {
+            *coin_latch = 1;
+            out.opbtn |= MAI2_IO_OPBTN_COIN;
+        }
+    } else {
+        *coin_latch = 0;
+    }
+
+    out
+}
+
+/// The body of `mai2_io_poll` without the shared memory, so tests can check which
+/// field each board lands in: `p1` is the 1P board (PID 52A5), `p2` the 2P board,
+/// and the coin latch lives in the poll page across polls.
+fn apply_poll(
+    poll_state: &mut Mai2PollPage,
+    p1: &Mai2InputPage,
+    p2: &Mai2InputPage,
+    keys: KeyboardOpbtns,
+) {
+    let buttons = decode_poll(p1, p2, keys, &mut poll_state.affine_coin);
+    poll_state.opbtn = buttons.opbtn;
+    poll_state.player1_btn = buttons.player1_btn;
+    poll_state.player2_btn = buttons.player2_btn;
+    poll_state.sequence = poll_state.sequence.wrapping_add(1);
+}
+
+/// The eight game buttons of one board. Select is not in `buttons0`: it comes from
+/// the function byte by pin, possibly from the other board (see `decode_poll`).
+fn map_buttons(buttons0: u8) -> u16 {
     let mut out = 0u16;
 
     if buttons0 & 0x01 != 0 {
@@ -1951,9 +2016,6 @@ fn map_buttons(buttons0: u8, buttons1: u8) -> u16 {
     }
     if buttons0 & 0x80 != 0 {
         out |= MAI2_IO_GAMEBTN_8;
-    }
-    if buttons1 & (1 << MAI2_AFFINE_EXT_SELECT_BIT) != 0 {
-        out |= MAI2_IO_GAMEBTN_SELECT;
     }
 
     out
@@ -2017,9 +2079,283 @@ mod tests {
 
     #[test]
     fn map_buttons_basic() {
-        assert_eq!(map_buttons(0, 0), 0);
-        assert_eq!(map_buttons(0x01, 0) & MAI2_IO_GAMEBTN_1, MAI2_IO_GAMEBTN_1);
-        assert_eq!(map_buttons(0x80, 0) & MAI2_IO_GAMEBTN_8, MAI2_IO_GAMEBTN_8);
+        assert_eq!(map_buttons(0), 0);
+        assert_eq!(map_buttons(0x01) & MAI2_IO_GAMEBTN_1, MAI2_IO_GAMEBTN_1);
+        assert_eq!(map_buttons(0x80) & MAI2_IO_GAMEBTN_8, MAI2_IO_GAMEBTN_8);
+        // All eight game buttons, and never Select: that comes from the function byte.
+        assert_eq!(map_buttons(0xFF), 0x00FF);
+    }
+
+    const NO_KEYS: KeyboardOpbtns = KeyboardOpbtns {
+        test: false,
+        service: false,
+        coin: false,
+    };
+
+    /// A connected board's input page.
+    fn board(buttons0: u8, io_status: u8) -> Mai2InputPage {
+        Mai2InputPage {
+            buttons0,
+            io_status,
+            connected: 1,
+            ..Default::default()
+        }
+    }
+
+    /// One poll from a fresh coin latch.
+    fn poll_once(p1: &Mai2InputPage, p2: &Mai2InputPage, keys: KeyboardOpbtns) -> PollButtons {
+        let mut coin_latch = 0u8;
+        decode_poll(p1, p2, keys, &mut coin_latch)
+    }
+
+    #[test]
+    fn function_bits_follow_the_pin_contract_on_either_board() {
+        // (bit, opbtn, player 1 gamebtn, player 2 gamebtn) for that one pin held.
+        let expected: [(u8, u8, u16, u16); 6] = [
+            (0, MAI2_IO_OPBTN_TEST, 0, 0),     // PC4  Test
+            (1, MAI2_IO_OPBTN_SERVICE, 0, 0),  // PB0  Service
+            (2, MAI2_IO_OPBTN_COIN, 0, 0),     // PB1  Coin
+            (3, 0, 0, 0),                      // PB2  card scan: keyboard Enter, not here
+            (4, 0, MAI2_IO_GAMEBTN_SELECT, 0), // PB10 1P Select
+            (5, 0, 0, MAI2_IO_GAMEBTN_SELECT), // PB11 2P Select
+        ];
+        let idle = board(0, 0);
+        for (bit, opbtn, player1_btn, player2_btn) in expected {
+            let want = PollButtons {
+                opbtn,
+                player1_btn,
+                player2_btn,
+            };
+            let pressed = board(0, 1 << bit);
+            assert_eq!(
+                poll_once(&pressed, &idle, NO_KEYS),
+                want,
+                "bit{bit} on 1P board"
+            );
+            assert_eq!(
+                poll_once(&idle, &pressed, NO_KEYS),
+                want,
+                "bit{bit} on 2P board"
+            );
+        }
+    }
+
+    #[test]
+    fn card_scan_bit_is_never_decoded() {
+        // bit3 used to be read as Coin, so a card tap also inserted a credit.
+        let card = board(0, 1 << 3);
+        let out = poll_once(&card, &card, NO_KEYS);
+        assert_eq!(out, PollButtons::default());
+    }
+
+    #[test]
+    fn select_pin_picks_the_player_not_the_board() {
+        let idle = board(0, 0);
+        let p1_select = 1 << MAI2_AFFINE_FN_P1_SELECT_BIT;
+        let p2_select = 1 << MAI2_AFFINE_FN_P2_SELECT_BIT;
+
+        // PB10 on the 2P board is still player 1's Select.
+        let out = poll_once(&idle, &board(0, p1_select), NO_KEYS);
+        assert_eq!(out.player1_btn, MAI2_IO_GAMEBTN_SELECT);
+        assert_eq!(out.player2_btn, 0);
+
+        // PB11 on the 1P board is still player 2's Select.
+        let out = poll_once(&board(0, p2_select), &idle, NO_KEYS);
+        assert_eq!(out.player1_btn, 0);
+        assert_eq!(out.player2_btn, MAI2_IO_GAMEBTN_SELECT);
+
+        // One board wired with both Selects gives both players theirs, even with
+        // the other board absent.
+        let out = poll_once(
+            &board(0, p1_select | p2_select),
+            &Mai2InputPage::default(),
+            NO_KEYS,
+        );
+        assert_eq!(out.player1_btn, MAI2_IO_GAMEBTN_SELECT);
+        assert_eq!(out.player2_btn, MAI2_IO_GAMEBTN_SELECT);
+
+        // Select joins the player's own game buttons; the other player's stay put.
+        let out = poll_once(&board(0x01, 0), &board(0x80, p1_select), NO_KEYS);
+        assert_eq!(out.player1_btn, MAI2_IO_GAMEBTN_1 | MAI2_IO_GAMEBTN_SELECT);
+        assert_eq!(out.player2_btn, MAI2_IO_GAMEBTN_8);
+        assert_eq!(out.opbtn, 0);
+    }
+
+    #[test]
+    fn disconnected_board_is_ignored() {
+        let stale = Mai2InputPage {
+            connected: 0,
+            ..board(0xFF, 0x3F)
+        };
+        assert_eq!(poll_once(&stale, &stale, NO_KEYS), PollButtons::default());
+    }
+
+    #[test]
+    fn coin_pulses_once_per_press_from_the_2p_board() {
+        let idle = board(0, 0);
+        let coin = board(0, 1 << MAI2_AFFINE_FN_COIN_BIT);
+        let mut latch = 0u8;
+        let mut opbtn =
+            |p1: &Mai2InputPage, p2: &Mai2InputPage| decode_poll(p1, p2, NO_KEYS, &mut latch).opbtn;
+
+        assert_eq!(opbtn(&idle, &coin), MAI2_IO_OPBTN_COIN); // rising edge
+        assert_eq!(opbtn(&idle, &coin), 0); // held: no repeat
+        assert_eq!(opbtn(&idle, &idle), 0); // released
+        assert_eq!(opbtn(&idle, &coin), MAI2_IO_OPBTN_COIN); // next press
+    }
+
+    #[test]
+    fn coin_on_both_boards_is_one_credit() {
+        let idle = board(0, 0);
+        let coin = board(0, 1 << MAI2_AFFINE_FN_COIN_BIT);
+        let mut latch = 0u8;
+        let mut opbtn =
+            |p1: &Mai2InputPage, p2: &Mai2InputPage| decode_poll(p1, p2, NO_KEYS, &mut latch).opbtn;
+
+        assert_eq!(opbtn(&coin, &coin), MAI2_IO_OPBTN_COIN);
+        assert_eq!(opbtn(&coin, &idle), 0); // 2P lets go while 1P still holds
+        assert_eq!(opbtn(&idle, &coin), 0); // hand-over without a release
+        assert_eq!(opbtn(&idle, &idle), 0);
+        assert_eq!(opbtn(&coin, &idle), MAI2_IO_OPBTN_COIN);
+    }
+
+    #[test]
+    fn coin_rearms_when_a_board_drops_mid_press() {
+        let idle = board(0, 0);
+        let coin = board(0, 1 << MAI2_AFFINE_FN_COIN_BIT);
+        let dropped = Mai2InputPage {
+            connected: 0,
+            ..coin
+        };
+        let mut latch = 0u8;
+
+        assert_eq!(
+            decode_poll(&idle, &coin, NO_KEYS, &mut latch).opbtn,
+            MAI2_IO_OPBTN_COIN
+        );
+        // The board vanishes with Coin still set in its last page: not held any more.
+        assert_eq!(decode_poll(&idle, &dropped, NO_KEYS, &mut latch).opbtn, 0);
+        assert_eq!(latch, 0);
+        // Back and pressed again: a fresh credit, not a stuck latch.
+        assert_eq!(
+            decode_poll(&idle, &coin, NO_KEYS, &mut latch).opbtn,
+            MAI2_IO_OPBTN_COIN
+        );
+    }
+
+    #[test]
+    fn keyboard_fallback_is_unchanged() {
+        let off = Mai2InputPage::default();
+
+        let test_service = KeyboardOpbtns {
+            test: true,
+            service: true,
+            coin: false,
+        };
+        assert_eq!(
+            poll_once(&off, &off, test_service),
+            PollButtons {
+                opbtn: MAI2_IO_OPBTN_TEST | MAI2_IO_OPBTN_SERVICE,
+                ..Default::default()
+            }
+        );
+
+        // F3 coin shares the hardware coin's edge: one credit while either is held.
+        let f3 = KeyboardOpbtns {
+            coin: true,
+            ..NO_KEYS
+        };
+        let coin_board = board(0, 1 << MAI2_AFFINE_FN_COIN_BIT);
+        let mut latch = 0u8;
+        assert_eq!(
+            decode_poll(&off, &off, f3, &mut latch).opbtn,
+            MAI2_IO_OPBTN_COIN
+        );
+        assert_eq!(decode_poll(&off, &off, f3, &mut latch).opbtn, 0);
+        assert_eq!(decode_poll(&coin_board, &off, f3, &mut latch).opbtn, 0);
+        assert_eq!(decode_poll(&off, &off, NO_KEYS, &mut latch).opbtn, 0);
+        assert_eq!(
+            decode_poll(&off, &off, f3, &mut latch).opbtn,
+            MAI2_IO_OPBTN_COIN
+        );
+    }
+
+    #[test]
+    fn poll_page_puts_each_player_in_its_own_field() {
+        let idle = board(0, 0);
+        let mut page = Mai2PollPage::default();
+
+        // 1P ring 1 plus the 2P board's PB11: the ring is player 1's, Select player 2's.
+        apply_poll(
+            &mut page,
+            &board(0x01, 0),
+            &board(0, 1 << MAI2_AFFINE_FN_P2_SELECT_BIT),
+            NO_KEYS,
+        );
+        assert_eq!(page.player1_btn, MAI2_IO_GAMEBTN_1);
+        assert_eq!(page.player2_btn, MAI2_IO_GAMEBTN_SELECT);
+        assert_eq!(page.opbtn, 0);
+
+        // 2P ring 8 plus the 1P board's Test: nothing crosses to player 1.
+        apply_poll(
+            &mut page,
+            &board(0, 1 << MAI2_AFFINE_FN_TEST_BIT),
+            &board(0x80, 0),
+            NO_KEYS,
+        );
+        assert_eq!(page.player1_btn, 0);
+        assert_eq!(page.player2_btn, MAI2_IO_GAMEBTN_8);
+        assert_eq!(page.opbtn, MAI2_IO_OPBTN_TEST);
+
+        // The coin edge is kept in the page between polls.
+        let coin = board(0, 1 << MAI2_AFFINE_FN_COIN_BIT);
+        apply_poll(&mut page, &idle, &coin, NO_KEYS);
+        assert_eq!(page.opbtn, MAI2_IO_OPBTN_COIN);
+        apply_poll(&mut page, &idle, &coin, NO_KEYS);
+        assert_eq!(page.opbtn, 0);
+        assert_eq!(page.sequence, 4);
+    }
+
+    #[test]
+    fn keyboard_fallback_reads_the_configured_io4_keys() {
+        let held = |vk: u16| move |key: u16| key == vk;
+        let config = KeyboardConfig::default();
+        assert_eq!(
+            KeyboardOpbtns::read(&config, held(VK_F1)),
+            KeyboardOpbtns {
+                test: true,
+                ..NO_KEYS
+            }
+        );
+        assert_eq!(
+            KeyboardOpbtns::read(&config, held(VK_F2)),
+            KeyboardOpbtns {
+                service: true,
+                ..NO_KEYS
+            }
+        );
+        assert_eq!(
+            KeyboardOpbtns::read(&config, held(VK_F3)),
+            KeyboardOpbtns {
+                coin: true,
+                ..NO_KEYS
+            }
+        );
+
+        // A remapped [io4] key is read from the config, not the F-key defaults.
+        let remapped = KeyboardConfig {
+            vk_test: 0x31,
+            vk_service: 0x32,
+            vk_coin: 0x33,
+        };
+        assert_eq!(KeyboardOpbtns::read(&remapped, held(VK_F2)), NO_KEYS);
+        assert_eq!(
+            KeyboardOpbtns::read(&remapped, held(0x32)),
+            KeyboardOpbtns {
+                service: true,
+                ..NO_KEYS
+            }
+        );
     }
 
     #[test]
