@@ -526,10 +526,8 @@ impl Mai2Runtime {
         }
 
         let mut payload = [0u8; 24];
-        for chunk in payload.chunks_exact_mut(3) {
-            chunk[0] = rgb[0];
-            chunk[1] = rgb[1];
-            chunk[2] = rgb[2];
+        for chunk in payload.as_chunks_mut::<3>().0 {
+            *chunk = [rgb[0], rgb[1], rgb[2]];
         }
 
         self.devices[board as usize].output_page.update(|page| {
