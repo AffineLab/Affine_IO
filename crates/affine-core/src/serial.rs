@@ -507,8 +507,10 @@ pub fn find_com_port(vid: u16, pid: u16) -> Option<String> {
 
 fn match_hwid(raw: &[u8], vid: u16, pid: u16) -> bool {
     let wide: Vec<u16> = raw
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| u16::from_le_bytes(pair))
         .collect();
     let vid_marker = format!("VID_{vid:04X}");
     let pid_marker = format!("PID_{pid:04X}");
@@ -539,8 +541,10 @@ fn match_hwid(raw: &[u8], vid: u16, pid: u16) -> bool {
 
 fn parse_com_name(raw: &[u8]) -> Option<String> {
     let wide: Vec<u16> = raw
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| u16::from_le_bytes(pair))
         .take_while(|&unit| unit != 0)
         .collect();
     let name = String::from_utf16_lossy(&wide);
