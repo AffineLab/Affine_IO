@@ -409,7 +409,11 @@ impl Mai2Runtime {
             // separate Touch-Stream HID (MI_05) reader is no longer used.
             thread::spawn(move || device_thread(serial_device, serial_shared));
             thread::spawn(move || hid_thread(device, shared));
+            let diag_device = touch_device.clone();
             thread::spawn(move || touch_callback_thread(touch_device, touch_shared));
+            if diag_device.diag {
+                thread::spawn(move || touch_diag_thread(diag_device));
+            }
         }
 
         log_line("Initialization complete.");
@@ -1459,17 +1463,6 @@ fn hid_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
 }
 
 fn touch_callback_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
-    let mut last_diag_ms = tick_ms();
-    let mut last_touch_frames = 0u64;
-    let mut last_serial_frames = 0u64;
-    let mut last_touch_hid_frames = 0u64;
-    let mut last_callback_frames = 0u64;
-    let mut last_heartbeat_writes = 0u64;
-    let mut last_led_writes = 0u64;
-    let mut last_led_button_writes = 0u64;
-    let mut last_led_billboard_writes = 0u64;
-    let mut last_led_pwm_writes = 0u64;
-
     loop {
         if device.enabled.load(Ordering::SeqCst) && device.output_page.read().touch_enabled != 0 {
             let touch = device.input_page.read().touch;
@@ -1484,107 +1477,128 @@ fn touch_callback_thread(device: Arc<DeviceHandle>, shared: Arc<SharedState>) {
                 }
                 device.touch_callback_frames.fetch_add(1, Ordering::SeqCst);
             }
-
-            let now = tick_ms();
-            if device.diag && now.saturating_sub(last_diag_ms) >= AFFINE_TOUCH_DIAG_INTERVAL_MS {
-                let touch_frames = device.touch_frames.load(Ordering::SeqCst);
-                let serial_frames = device.touch_serial_frames.load(Ordering::SeqCst);
-                let touch_hid_frames = device.touch_hid_frames.load(Ordering::SeqCst);
-                let callback_frames = device.touch_callback_frames.load(Ordering::SeqCst);
-                let last_update_ms = device.touch_last_update_ms.load(Ordering::SeqCst);
-                let heartbeat_writes = device.heartbeat_writes.load(Ordering::SeqCst);
-                let heartbeat_failures = device.heartbeat_failures.load(Ordering::SeqCst);
-                let led_writes = device.led_writes.load(Ordering::SeqCst);
-                let led_button_writes = device.led_button_writes.load(Ordering::SeqCst);
-                let led_billboard_writes = device.led_billboard_writes.load(Ordering::SeqCst);
-                let led_pwm_writes = device.led_pwm_writes.load(Ordering::SeqCst);
-                let led_failures = device.led_failures.load(Ordering::SeqCst);
-                let led_suspended = device.led_suspended.load(Ordering::SeqCst) as u8;
-                let reconnects = device.serial_reconnects.load(Ordering::SeqCst);
-                let vendor_reconnects = device.vendor_reconnects.load(Ordering::SeqCst);
-                let last_update_age = if last_update_ms == 0 {
-                    u64::MAX
-                } else {
-                    now.saturating_sub(last_update_ms)
-                };
-                let last_update_display = if last_update_age == u64::MAX {
-                    String::from("never")
-                } else {
-                    format!("{last_update_age}ms")
-                };
-
-                log_diag(&format!(
-                    "P{} diag link  buttons_hid={} vendor_hid={} touch_hid={} suspend={} reconn=s{}/v{} last_update={}",
-                    device.player,
-                    device.hid_connected.load(Ordering::SeqCst) as u8,
-                    device.vendor_connected.load(Ordering::SeqCst) as u8,
-                    device.touch_hid_connected.load(Ordering::SeqCst) as u8,
-                    led_suspended,
-                    reconnects,
-                    vendor_reconnects,
-                    last_update_display,
-                ));
-                log_diag(&format!(
-                    "P{} diag rate  touch={} (+{}) cdc={} (+{}) touch_hid={} (+{}) cb={} (+{}) hb={} (+{}) hb_fail={}",
-                    device.player,
-                    touch_frames,
-                    touch_frames.saturating_sub(last_touch_frames),
-                    serial_frames,
-                    serial_frames.saturating_sub(last_serial_frames),
-                    touch_hid_frames,
-                    touch_hid_frames.saturating_sub(last_touch_hid_frames),
-                    callback_frames,
-                    callback_frames.saturating_sub(last_callback_frames),
-                    heartbeat_writes,
-                    heartbeat_writes.saturating_sub(last_heartbeat_writes),
-                    heartbeat_failures,
-                ));
-                log_diag(&format!(
-                    "P{} diag led   set={} (+{}) btn={} (+{}) bb={} (+{}) pwm={} (+{}) fail={} | touch={:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
-                    device.player,
-                    led_writes,
-                    led_writes.saturating_sub(last_led_writes),
-                    led_button_writes,
-                    led_button_writes.saturating_sub(last_led_button_writes),
-                    led_billboard_writes,
-                    led_billboard_writes.saturating_sub(last_led_billboard_writes),
-                    led_pwm_writes,
-                    led_pwm_writes.saturating_sub(last_led_pwm_writes),
-                    led_failures,
-                    touch[0],
-                    touch[1],
-                    touch[2],
-                    touch[3],
-                    touch[4],
-                    touch[5],
-                    touch[6],
-                ));
-                let (btn0, io_status) = {
-                    let page = device.input_page.read();
-                    (page.buttons0, page.io_status)
-                };
-                log_diag(&format!(
-                    "P{} diag input btn0={:02X} io={:02X} game={:04X}",
-                    device.player,
-                    btn0,
-                    io_status,
-                    map_buttons(btn0),
-                ));
-
-                last_diag_ms = now;
-                last_touch_frames = touch_frames;
-                last_serial_frames = serial_frames;
-                last_touch_hid_frames = touch_hid_frames;
-                last_callback_frames = callback_frames;
-                last_heartbeat_writes = heartbeat_writes;
-                last_led_writes = led_writes;
-                last_led_button_writes = led_button_writes;
-                last_led_billboard_writes = led_billboard_writes;
-                last_led_pwm_writes = led_pwm_writes;
-            }
         }
 
         sleep_ms(1);
+    }
+}
+
+/// Prints the `pXDebugInput` counters every `AFFINE_TOUCH_DIAG_INTERVAL_MS`.
+/// It has its own thread because a console write can block for tens of
+/// milliseconds: printed from `touch_callback_thread`, the four lines held the
+/// game's touch callback back every 2 s, which delayed touches and lost short ones.
+fn touch_diag_thread(device: Arc<DeviceHandle>) {
+    let mut last_touch_frames = 0u64;
+    let mut last_serial_frames = 0u64;
+    let mut last_touch_hid_frames = 0u64;
+    let mut last_callback_frames = 0u64;
+    let mut last_heartbeat_writes = 0u64;
+    let mut last_led_writes = 0u64;
+    let mut last_led_button_writes = 0u64;
+    let mut last_led_billboard_writes = 0u64;
+    let mut last_led_pwm_writes = 0u64;
+
+    loop {
+        sleep_ms(AFFINE_TOUCH_DIAG_INTERVAL_MS);
+        if !device.enabled.load(Ordering::SeqCst) || device.output_page.read().touch_enabled == 0 {
+            continue;
+        }
+
+        let now = tick_ms();
+        let touch = device.input_page.read().touch;
+        let touch_frames = device.touch_frames.load(Ordering::SeqCst);
+        let serial_frames = device.touch_serial_frames.load(Ordering::SeqCst);
+        let touch_hid_frames = device.touch_hid_frames.load(Ordering::SeqCst);
+        let callback_frames = device.touch_callback_frames.load(Ordering::SeqCst);
+        let last_update_ms = device.touch_last_update_ms.load(Ordering::SeqCst);
+        let heartbeat_writes = device.heartbeat_writes.load(Ordering::SeqCst);
+        let heartbeat_failures = device.heartbeat_failures.load(Ordering::SeqCst);
+        let led_writes = device.led_writes.load(Ordering::SeqCst);
+        let led_button_writes = device.led_button_writes.load(Ordering::SeqCst);
+        let led_billboard_writes = device.led_billboard_writes.load(Ordering::SeqCst);
+        let led_pwm_writes = device.led_pwm_writes.load(Ordering::SeqCst);
+        let led_failures = device.led_failures.load(Ordering::SeqCst);
+        let led_suspended = device.led_suspended.load(Ordering::SeqCst) as u8;
+        let reconnects = device.serial_reconnects.load(Ordering::SeqCst);
+        let vendor_reconnects = device.vendor_reconnects.load(Ordering::SeqCst);
+        let last_update_age = if last_update_ms == 0 {
+            u64::MAX
+        } else {
+            now.saturating_sub(last_update_ms)
+        };
+        let last_update_display = if last_update_age == u64::MAX {
+            String::from("never")
+        } else {
+            format!("{last_update_age}ms")
+        };
+
+        log_diag(&format!(
+            "P{} diag link  buttons_hid={} vendor_hid={} touch_hid={} suspend={} reconn=s{}/v{} last_update={}",
+            device.player,
+            device.hid_connected.load(Ordering::SeqCst) as u8,
+            device.vendor_connected.load(Ordering::SeqCst) as u8,
+            device.touch_hid_connected.load(Ordering::SeqCst) as u8,
+            led_suspended,
+            reconnects,
+            vendor_reconnects,
+            last_update_display,
+        ));
+        log_diag(&format!(
+            "P{} diag rate  touch={} (+{}) cdc={} (+{}) touch_hid={} (+{}) cb={} (+{}) hb={} (+{}) hb_fail={}",
+            device.player,
+            touch_frames,
+            touch_frames.saturating_sub(last_touch_frames),
+            serial_frames,
+            serial_frames.saturating_sub(last_serial_frames),
+            touch_hid_frames,
+            touch_hid_frames.saturating_sub(last_touch_hid_frames),
+            callback_frames,
+            callback_frames.saturating_sub(last_callback_frames),
+            heartbeat_writes,
+            heartbeat_writes.saturating_sub(last_heartbeat_writes),
+            heartbeat_failures,
+        ));
+        log_diag(&format!(
+            "P{} diag led   set={} (+{}) btn={} (+{}) bb={} (+{}) pwm={} (+{}) fail={} | touch={:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+            device.player,
+            led_writes,
+            led_writes.saturating_sub(last_led_writes),
+            led_button_writes,
+            led_button_writes.saturating_sub(last_led_button_writes),
+            led_billboard_writes,
+            led_billboard_writes.saturating_sub(last_led_billboard_writes),
+            led_pwm_writes,
+            led_pwm_writes.saturating_sub(last_led_pwm_writes),
+            led_failures,
+            touch[0],
+            touch[1],
+            touch[2],
+            touch[3],
+            touch[4],
+            touch[5],
+            touch[6],
+        ));
+        let (btn0, io_status) = {
+            let page = device.input_page.read();
+            (page.buttons0, page.io_status)
+        };
+        log_diag(&format!(
+            "P{} diag input btn0={:02X} io={:02X} game={:04X}",
+            device.player,
+            btn0,
+            io_status,
+            map_buttons(btn0),
+        ));
+
+        last_touch_frames = touch_frames;
+        last_serial_frames = serial_frames;
+        last_touch_hid_frames = touch_hid_frames;
+        last_callback_frames = callback_frames;
+        last_heartbeat_writes = heartbeat_writes;
+        last_led_writes = led_writes;
+        last_led_button_writes = led_button_writes;
+        last_led_billboard_writes = led_billboard_writes;
+        last_led_pwm_writes = led_pwm_writes;
     }
 }
 
